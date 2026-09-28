@@ -111,9 +111,31 @@ fn preserve_window_size_on_rotation(
     }
 }
 
+fn mirrored_pinch_point(center: Coords, point: Coords) -> Coords {
+    (center.0 * 2.0 - point.0, center.1 * 2.0 - point.1)
+}
+
+fn pinch_axis(center: Coords, point: Coords) -> Coords {
+    let dx = point.0 - center.0;
+    let dy = point.1 - center.1;
+    let distance = (dx * dx + dy * dy).sqrt();
+    if distance > f32::EPSILON {
+        (dx / distance, dy / distance)
+    } else {
+        (1.0, 0.0)
+    }
+}
+
+fn pinch_distance(center: Coords, point: Coords, axis: Coords, max_distance: f32) -> f32 {
+    ((point.0 - center.0) * axis.0 + (point.1 - center.1) * axis.1).clamp(0.0, max_distance)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{preserve_window_size_on_rotation, DeviceOrientation};
+    use super::{
+        mirrored_pinch_point, pinch_axis, pinch_distance, preserve_window_size_on_rotation, Coords,
+        DeviceOrientation,
+    };
 
     #[test]
     fn rotation_preserves_size_within_same_orientation_axis() {
@@ -153,6 +175,21 @@ mod tests {
             ),
             (900, 600)
         );
+    }
+
+    #[test]
+    fn pinch_second_point_is_mirrored_around_center() {
+        let center: Coords = (400.0, 300.0);
+        let first: Coords = (250.0, 220.0);
+        assert_eq!(mirrored_pinch_point(center, first), (550.0, 380.0));
+    }
+
+    #[test]
+    fn pinch_distance_stays_on_the_initial_axis_and_side() {
+        let center: Coords = (400.0, 300.0);
+        let axis = pinch_axis(center, (250.0, 220.0));
+        assert!((pinch_distance(center, (100.0, 140.0), axis, 300.0) - 300.0).abs() < 0.001);
+        assert_eq!(pinch_distance(center, (600.0, 200.0), axis, 300.0), 0.0);
     }
 }
 
@@ -201,9 +238,14 @@ pub enum FingerId {
 pub type Coords = (f32, f32);
 
 struct PinchState {
-    anchor: Coords,
+    /// The desktop gesture is intentionally locked to this initial axis. This
+    /// makes zooming predictable, but does not support two-finger rotation
+    /// gestures; rotation would require tracking the changing angle instead.
+    center: Coords,
     axis: Coords,
-    active: Coords,
+    max_distance: f32,
+    first: Coords,
+    second: Coords,
 }
 
 struct DpadState {
@@ -1239,44 +1281,54 @@ impl Window {
 
     fn pinch_points(&self) -> Option<(Coords, Coords)> {
         let state = self.pinch_state.as_ref()?;
-        Some((state.anchor, state.active))
+        Some((state.first, state.second))
     }
 
     fn start_pinch(&mut self, x: f32, y: f32) {
         let (viewport_x, viewport_y, viewport_width, viewport_height) = self.viewport();
-        let anchor = (
+        let center = (
             viewport_x as f32 + viewport_width as f32 / 2.0,
             viewport_y as f32 + viewport_height as f32 / 2.0,
         );
-        let dx = x - anchor.0;
-        let dy = y - anchor.1;
-        let distance = (dx * dx + dy * dy).sqrt();
-        let axis = if distance > 1.0 {
-            (dx / distance, dy / distance)
-        } else {
-            (1.0, 0.0)
-        };
+        let first = (x, y);
+        let axis = pinch_axis(center, first);
+        let half_width = viewport_width as f32 / 2.0;
+        let half_height = viewport_height as f32 / 2.0;
+        let max_distance = [
+            if axis.0.abs() > f32::EPSILON {
+                half_width / axis.0.abs()
+            } else {
+                f32::INFINITY
+            },
+            if axis.1.abs() > f32::EPSILON {
+                half_height / axis.1.abs()
+            } else {
+                f32::INFINITY
+            },
+        ]
+        .into_iter()
+        .fold(f32::INFINITY, f32::min);
 
         self.pinch_mouse_button_active = true;
         self.pinch_state = Some(PinchState {
-            anchor,
+            center,
             axis,
-            active: (x, y),
+            max_distance,
+            first,
+            second: mirrored_pinch_point(center, first),
         });
     }
 
     fn update_pinch(&mut self, x: f32, y: f32) {
-        let (_, _, viewport_width, viewport_height) = self.viewport();
         let Some(state) = self.pinch_state.as_mut() else {
             return;
         };
-        let max_distance = viewport_width.min(viewport_height) as f32 / 2.0 - 10.0;
-        let distance = ((x - state.anchor.0) * state.axis.0 + (y - state.anchor.1) * state.axis.1)
-            .clamp(10.0, max_distance.max(10.0));
-        state.active = (
-            state.anchor.0 + state.axis.0 * distance,
-            state.anchor.1 + state.axis.1 * distance,
+        let distance = pinch_distance(state.center, (x, y), state.axis, state.max_distance);
+        state.first = (
+            state.center.0 + state.axis.0 * distance,
+            state.center.1 + state.axis.1 * distance,
         );
+        state.second = mirrored_pinch_point(state.center, state.first);
     }
 
     fn constrain_window_size(&mut self, requested_width: u32, requested_height: u32) {
