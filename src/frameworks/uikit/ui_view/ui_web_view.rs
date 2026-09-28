@@ -9,36 +9,36 @@ use crate::frameworks::foundation::ns_string::to_rust_string;
 use crate::objc::{id, nil, objc_classes, ClassExports};
 use crate::{msg, msg_super};
 use std::borrow::Cow;
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use std::process::Command;
 
 fn open_external_url(url: &str) -> Result<(), String> {
-    #[cfg(target_os = "macos")]
-    let mut command = {
-        let mut command = Command::new("open");
-        command.arg(url);
-        command
-    };
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    {
+        let mut command = if cfg!(target_os = "macos") {
+            let mut command = Command::new("open");
+            command.arg(url);
+            command
+        } else {
+            let mut command = Command::new("rundll32.exe");
+            command.args(["url.dll,FileProtocolHandler", url]);
+            command
+        };
 
-    #[cfg(target_os = "windows")]
-    let mut command = {
-        let mut command = Command::new("rundll32.exe");
-        command.args(["url.dll,FileProtocolHandler", url]);
-        command
-    };
+        let status = command
+            .status()
+            .map_err(|error| format!("failed to launch browser: {error}"))?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(format!("browser launcher exited with status {status}"))
+        }
+    }
 
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         let _ = url;
-        return Err("external browser launching is unsupported on this platform".to_string());
-    }
-
-    let status = command
-        .status()
-        .map_err(|error| format!("failed to launch browser: {error}"))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!("browser launcher exited with status {status}"))
+        Err("external browser launching is unsupported on this platform".to_string())
     }
 }
 
