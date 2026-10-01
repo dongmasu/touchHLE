@@ -5,45 +5,66 @@
  */
 use super::model::{RelativePath, SnapshotEntry, SyncError};
 use crate::paths::{APPS_DIR, SANDBOX_DIR};
+use cap_fs_ext::DirExt;
+use cap_std::ambient_authority;
+use cap_std::fs::{Dir, OpenOptions};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
-use std::fs;
 use std::io::Read;
 use std::path::Path;
 use std::time::UNIX_EPOCH;
 use unicode_casefold::UnicodeCaseFold;
 
 pub fn scan_roots(base: &Path) -> Result<BTreeMap<RelativePath, SnapshotEntry>, SyncError> {
+    scan_roots_with_hook(base, |_| {})
+}
+
+fn scan_roots_with_hook(
+    base: &Path,
+    mut before_open: impl FnMut(&Path),
+) -> Result<BTreeMap<RelativePath, SnapshotEntry>, SyncError> {
     let mut entries = BTreeMap::new();
     let mut names = BTreeMap::new();
+    let base_dir = Dir::open_ambient_dir(base, ambient_authority())?;
     for root in [APPS_DIR, SANDBOX_DIR] {
         let path = base.join(root);
-        let metadata = match fs::symlink_metadata(&path) {
+        let metadata = match base_dir.symlink_metadata(root) {
             Ok(metadata) => metadata,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => return Err(e.into()),
         };
         if metadata.is_dir() {
-            scan_directory(&path, root, &mut names, &mut entries)?;
+            before_open(&path);
+            let root_dir = base_dir.open_dir_nofollow(root)?;
+            scan_directory(
+                &root_dir,
+                &path,
+                root,
+                &mut before_open,
+                &mut names,
+                &mut entries,
+            )?;
         }
     }
     Ok(entries)
 }
 
 fn scan_directory(
-    directory: &Path,
+    directory: &Dir,
+    display_path: &Path,
     relative: &str,
+    before_open: &mut impl FnMut(&Path),
     names: &mut BTreeMap<String, String>,
     entries: &mut BTreeMap<RelativePath, SnapshotEntry>,
 ) -> Result<(), SyncError> {
-    for item in fs::read_dir(directory)? {
+    for item in directory.read_dir(".")? {
         let item = item?;
         let name = item
             .file_name()
             .into_string()
             .map_err(|name| SyncError::InvalidPath(format!("non-UTF-8 filename: {name:?}")))?;
-        let path = item.path();
-        let metadata = fs::symlink_metadata(&path)?;
+        let path = display_path.join(&name);
+        let metadata = directory.symlink_metadata(&name)?;
         if !metadata.is_dir() && !metadata.is_file() {
             continue;
         }
@@ -59,25 +80,32 @@ fn scan_directory(
             }
         }
         if metadata.is_dir() {
-            scan_directory(&path, key.as_str(), names, entries)?;
+            before_open(&path);
+            let child = directory.open_dir_nofollow(&name)?;
+            scan_directory(&child, &path, key.as_str(), before_open, names, entries)?;
         } else {
-            entries.insert(key, hash_file(&path)?);
+            before_open(&path);
+            entries.insert(key, hash_file(directory, &name, &path)?);
         }
     }
     Ok(())
 }
 
-fn hash_file(path: &Path) -> Result<SnapshotEntry, SyncError> {
+fn hash_file(directory: &Dir, name: &str, path: &Path) -> Result<SnapshotEntry, SyncError> {
+    let mut options = OpenOptions::new();
+    options.read(true);
     #[cfg(unix)]
-    let mut file = {
-        use std::os::unix::fs::OpenOptionsExt;
-        fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(path)?
-    };
-    #[cfg(not(unix))]
-    let mut file = fs::File::open(path)?;
+    {
+        use cap_fs_ext::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use cap_fs_ext::OpenOptionsExt;
+        // FILE_FLAG_OPEN_REPARSE_POINT opens the link, not its target.
+        options.custom_flags(0x0020_0000);
+    }
+    let mut file = directory.open_with(name, &options)?;
 
     let metadata = file.metadata()?;
     if !metadata.is_file() {
@@ -87,7 +115,7 @@ fn hash_file(path: &Path) -> Result<SnapshotEntry, SyncError> {
         )));
     }
     let modified = metadata.modified()?;
-    let millis = match modified.duration_since(UNIX_EPOCH) {
+    let millis = match modified.into_std().duration_since(UNIX_EPOCH) {
         Ok(duration) => duration.as_millis() as i128,
         Err(e) => -(e.duration().as_millis() as i128),
     };
@@ -209,5 +237,123 @@ mod tests {
             scan_roots(&tree.0),
             Err(SyncError::InvalidPath(_))
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_replaced_with_symlink_is_never_traversed() {
+        use std::os::unix::fs::symlink;
+
+        let tree = TestTree::new();
+        let outside = tree.0.join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("secret"), b"outside data").unwrap();
+        let root = tree.0.join(APPS_DIR);
+        fs::create_dir(&root).unwrap();
+        let nested = root.join("nested");
+        fs::create_dir(&nested).unwrap();
+        let mut swapped = false;
+        let result = scan_roots_with_hook(&tree.0, |path| {
+            if path == nested && !swapped {
+                let parked = root.join("parked");
+                fs::rename(&nested, &parked).unwrap();
+                symlink(&outside, &nested).unwrap();
+                swapped = true;
+            }
+        });
+        assert!(swapped);
+        assert!(
+            result.is_err()
+                || !result
+                    .unwrap()
+                    .contains_key(&RelativePath::new("touchHLE_apps/nested/secret").unwrap())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn root_replaced_with_symlink_is_never_traversed() {
+        use std::os::unix::fs::symlink;
+
+        let tree = TestTree::new();
+        let outside = tree.0.join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("secret"), b"outside data").unwrap();
+        let root = tree.0.join(APPS_DIR);
+        fs::create_dir(&root).unwrap();
+        let mut swapped = false;
+        let result = scan_roots_with_hook(&tree.0, |path| {
+            if path == root && !swapped {
+                fs::rename(&root, tree.0.join("parked")).unwrap();
+                symlink(&outside, &root).unwrap();
+                swapped = true;
+            }
+        });
+        assert!(swapped);
+        assert!(
+            result.is_err()
+                || !result
+                    .unwrap()
+                    .contains_key(&RelativePath::new("touchHLE_apps/secret").unwrap())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parent_replaced_before_file_open_cannot_redirect_hashing() {
+        use std::os::unix::fs::symlink;
+
+        let tree = TestTree::new();
+        let outside = tree.0.join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("save"), b"outside").unwrap();
+        let root = tree.0.join(APPS_DIR);
+        let nested = root.join("nested");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(nested.join("save"), b"inside").unwrap();
+        let mut swapped = false;
+        let entries = scan_roots_with_hook(&tree.0, |path| {
+            if path == nested.join("save") && !swapped {
+                fs::rename(&nested, root.join("parked")).unwrap();
+                symlink(&outside, &nested).unwrap();
+                swapped = true;
+            }
+        })
+        .unwrap();
+        assert!(swapped);
+        let key = RelativePath::new("touchHLE_apps/nested/save").unwrap();
+        match &entries[&key] {
+            SnapshotEntry::File { sha256, .. } => {
+                let inside: [u8; 32] = Sha256::digest(b"inside").into();
+                let outside: [u8; 32] = Sha256::digest(b"outside").into();
+                assert_eq!(*sha256, inside);
+                assert_ne!(*sha256, outside);
+            }
+            SnapshotEntry::Tombstone => panic!("scanned a tombstone"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_replaced_with_symlink_before_open_is_not_hashed() {
+        use std::os::unix::fs::symlink;
+
+        let tree = TestTree::new();
+        let outside = tree.0.join("outside");
+        fs::write(&outside, b"outside").unwrap();
+        let root = tree.0.join(APPS_DIR);
+        fs::create_dir(&root).unwrap();
+        let file = root.join("save");
+        fs::write(&file, b"inside").unwrap();
+        let mut swapped = false;
+        let result = scan_roots_with_hook(&tree.0, |path| {
+            if path == file && !swapped {
+                fs::rename(&file, root.join("parked")).unwrap();
+                symlink(&outside, &file).unwrap();
+                swapped = true;
+            }
+        });
+        assert!(swapped);
+        assert!(result.is_err());
     }
 }

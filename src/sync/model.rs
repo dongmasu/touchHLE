@@ -25,7 +25,7 @@ impl RelativePath {
         let mut parts = path.split('/');
         if !matches!(parts.next(), Some(APPS_DIR | SANDBOX_DIR))
             || parts.clone().next().is_none()
-            || parts.any(|part| part.is_empty() || part == "." || part == "..")
+            || parts.any(invalid_component)
         {
             return Err(SyncError::InvalidPath(path.to_owned()));
         }
@@ -35,6 +35,29 @@ impl RelativePath {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+}
+
+fn invalid_component(part: &str) -> bool {
+    if part.is_empty()
+        || part == "."
+        || part == ".."
+        || part.ends_with(['.', ' '])
+        || part
+            .chars()
+            .any(|c| c <= '\u{1f}' || matches!(c, '<' | '>' | '"' | '|' | '?' | '*'))
+    {
+        return true;
+    }
+    let stem = part.split('.').next().unwrap_or(part).trim_end_matches(' ');
+    let reserved = stem.to_ascii_uppercase();
+    matches!(reserved.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || (reserved.len() == 4
+            && (reserved.starts_with("COM") || reserved.starts_with("LPT"))
+            && matches!(reserved.as_bytes()[3], b'1'..=b'9'))
+        || (stem.get(..3).is_some_and(|prefix| {
+            prefix.eq_ignore_ascii_case("COM") || prefix.eq_ignore_ascii_case("LPT")
+        }) && stem[3..].chars().count() == 1
+            && matches!(stem[3..].chars().next(), Some('¹' | '²' | '³')))
 }
 
 impl<'de> Deserialize<'de> for RelativePath {
@@ -110,6 +133,24 @@ fn deserialize_entries<'de, D: Deserializer<'de>>(
                 }
                 if entries.insert(key, entry).is_some() {
                     return Err(M::Error::custom("duplicate snapshot path"));
+                }
+            }
+            for (key, entry) in &entries {
+                if !matches!(entry, SnapshotEntry::File { .. }) {
+                    continue;
+                }
+                let mut prefix = key.as_str();
+                while let Some((parent, _)) = prefix.rsplit_once('/') {
+                    if matches!(
+                        entries.get(&RelativePath(parent.to_owned())),
+                        Some(SnapshotEntry::File { .. })
+                    ) {
+                        return Err(M::Error::custom(format!(
+                            "live file is an ancestor of another live file: {parent} and {}",
+                            key.as_str()
+                        )));
+                    }
+                    prefix = parent;
                 }
             }
             Ok(entries)
@@ -231,6 +272,18 @@ mod tests {
             "touchHLE_apps",
             "other/file",
             "touchHLE_apps/C:/file",
+            "touchHLE_apps/CON",
+            "touchHLE_apps/con.txt",
+            "touchHLE_apps/CON .txt",
+            "touchHLE_apps/aux.txt",
+            "touchHLE_apps/COM1/save",
+            "touchHLE_apps/LPT³/file",
+            "touchHLE_sandbox/file.",
+            "touchHLE_sandbox/folder /save",
+            "touchHLE_apps/file?",
+            "touchHLE_apps/a*",
+            "touchHLE_apps/a|b",
+            "touchHLE_apps/a\u{1f}b",
         ] {
             assert!(RelativePath::new(path).is_err(), "{path}");
             assert!(
@@ -239,6 +292,36 @@ mod tests {
                 "{path}"
             );
         }
+    }
+
+    #[test]
+    fn live_files_cannot_be_ancestors_of_other_live_files() {
+        let id = Uuid::new_v4();
+        let file = r#"{"File":{"sha256":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],"size":0,"modified_unix_ms":0}}"#;
+        for paths in [
+            format!(r#""touchHLE_apps/foo":{file},"touchHLE_apps/foo/bar":{file}"#),
+            format!(r#""touchHLE_apps/foo/bar":{file},"touchHLE_apps/foo":{file}"#),
+        ] {
+            let commit = format!(
+                r#"{{"id":"{id}","device_id":"{id}","created_unix_ms":0,"parents":[],"entries":{{{paths}}}}}"#
+            );
+            let state = format!(
+                r#"{{"device_id":"{id}","last_applied_commit":null,"baseline":{{{paths}}}}}"#
+            );
+            assert!(serde_json::from_str::<Commit>(&commit).is_err(), "{paths}");
+            assert!(
+                serde_json::from_str::<SyncState>(&state).is_err(),
+                "{paths}"
+            );
+        }
+        let tombstone_ancestor = format!(
+            r#"{{"id":"{id}","device_id":"{id}","created_unix_ms":0,"parents":[],"entries":{{"touchHLE_apps/foo":"Tombstone","touchHLE_apps/foo/bar":{file}}}}}"#
+        );
+        assert!(serde_json::from_str::<Commit>(&tombstone_ancestor).is_ok());
+        let tombstone_descendant = format!(
+            r#"{{"id":"{id}","device_id":"{id}","created_unix_ms":0,"parents":[],"entries":{{"touchHLE_apps/foo":{file},"touchHLE_apps/foo/bar":"Tombstone"}}}}"#
+        );
+        assert!(serde_json::from_str::<Commit>(&tombstone_descendant).is_ok());
     }
 
     #[test]
