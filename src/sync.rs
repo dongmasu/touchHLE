@@ -4,6 +4,8 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 pub mod apply;
+pub mod engine;
 pub mod merge;
 pub mod model;
 pub mod scan;
+pub mod store;
