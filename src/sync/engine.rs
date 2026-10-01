@@ -61,48 +61,40 @@ impl<S: RemoteStore> SyncEngine<S> {
             other => other?,
         };
         let tips = resolve_remote_tips(&commits)?;
+        validate_baseline_ancestry(state.last_applied_commit, &commits, &tips)?;
         let plan = plan_sync(&state.baseline, &local, &tips)?;
         if !plan.conflicts.is_empty() {
             return Ok(SyncOutcome::Conflicts(plan));
         }
         let resolved = plan.resolved_snapshot(&[])?;
-        let publish = !plan.publish_local.is_empty()
-            || tips.len() > 1
-            || (tips.is_empty() && !resolved.is_empty());
+        let publish = !plan.publish_local.is_empty() || tips.len() > 1 || tips.is_empty();
         let apply = !plan.apply_remote.is_empty();
 
         if publish {
-            // A full snapshot commit must never reference an unverified object.
+            let referenced_objects: std::collections::BTreeSet<_> = commits
+                .iter()
+                .flat_map(|commit| commit.entries.values())
+                .filter_map(|entry| match entry {
+                    SnapshotEntry::File { sha256, .. } => Some(*sha256),
+                    SnapshotEntry::Tombstone => None,
+                })
+                .collect();
+            let mut uploaded = std::collections::BTreeSet::new();
+            // Existing history references are trusted; verify only new uploads here.
             for (path, entry) in &resolved {
                 let SnapshotEntry::File { sha256, size, .. } = entry else {
                     continue;
                 };
-                let remote = self.store.read_object(sha256)?;
-                if let Some(bytes) = remote {
-                    verify_object(&bytes, sha256, *size)?;
-                } else {
-                    let bytes = read_local(&self.root, path)?;
-                    verify_object(&bytes, sha256, *size)?;
-                    self.store.write_object(*sha256, &bytes)?;
-                    let written = self.store.read_object(sha256)?.ok_or_else(|| {
-                        SyncError::Integrity(format!(
-                            "object absent after write: {}",
-                            hex_hash(sha256)
-                        ))
-                    })?;
-                    verify_object(&written, sha256, *size)?;
+                if referenced_objects.contains(sha256) || !uploaded.insert(*sha256) {
+                    continue;
                 }
-            }
-        } else {
-            // Even a converged local copy cannot justify advancing state if
-            // its referenced cloud object has gone missing or been corrupted.
-            for entry in resolved.values() {
-                if let SnapshotEntry::File { sha256, size, .. } = entry {
-                    let bytes = self.store.read_object(sha256)?.ok_or_else(|| {
-                        SyncError::Integrity(format!("missing remote object {}", hex_hash(sha256)))
-                    })?;
-                    verify_object(&bytes, sha256, *size)?;
-                }
+                let bytes = read_local(&self.root, path)?;
+                verify_object(&bytes, sha256, *size)?;
+                self.store.write_object(*sha256, &bytes)?;
+                let written = self.store.read_object(sha256)?.ok_or_else(|| {
+                    SyncError::Integrity(format!("object absent after write: {}", hex_hash(sha256)))
+                })?;
+                verify_object(&written, sha256, *size)?;
             }
         }
 
@@ -125,12 +117,18 @@ impl<S: RemoteStore> SyncEngine<S> {
             tips.first().map(|tip| tip.commit_id)
         };
 
-        // Stage only after publication has succeeded; the staging layer
-        // cleans up its own scratch files if any download fails.
+        // Staging verifies selected remote bytes and caches each content hash.
+        // The staging layer cleans up its own scratch files on failure.
+        let mut staged_objects = BTreeMap::<[u8; 32], Vec<u8>>::new();
         let staged = stage_remote_files(&self.root, &plan, &[], |hash| {
-            self.store.read_object(hash)?.ok_or_else(|| {
+            if let Some(bytes) = staged_objects.get(hash) {
+                return Ok(bytes.clone());
+            }
+            let bytes = self.store.read_object(hash)?.ok_or_else(|| {
                 SyncError::Integrity(format!("missing remote object {}", hex_hash(hash)))
-            })
+            })?;
+            staged_objects.insert(*hash, bytes.clone());
+            Ok(bytes)
         })?;
         apply_staged_files(&self.root, staged)?;
         if state.baseline != resolved
@@ -155,6 +153,46 @@ impl<S: RemoteStore> SyncEngine<S> {
             SyncOutcome::UpToDate
         })
     }
+}
+
+fn validate_baseline_ancestry(
+    last_applied: Option<Uuid>,
+    commits: &[Commit],
+    tips: &[super::merge::RemoteTip],
+) -> Result<(), SyncError> {
+    let Some(baseline_id) = last_applied else {
+        return Ok(());
+    };
+    let by_id: BTreeMap<_, _> = commits.iter().map(|commit| (commit.id, commit)).collect();
+    if !by_id.contains_key(&baseline_id) {
+        return Err(SyncError::Integrity(format!(
+            "last applied commit is missing from remote history: {baseline_id}"
+        )));
+    }
+    for tip in tips {
+        let mut pending = vec![tip.commit_id];
+        let mut visited = std::collections::BTreeSet::new();
+        let mut found = false;
+        while let Some(id) = pending.pop() {
+            if !visited.insert(id) {
+                continue;
+            }
+            if id == baseline_id {
+                found = true;
+                break;
+            }
+            if let Some(commit) = by_id.get(&id) {
+                pending.extend(commit.parents.iter().copied());
+            }
+        }
+        if !found {
+            return Err(SyncError::Integrity(format!(
+                "remote tip {} is not descended from last applied commit {baseline_id}",
+                tip.commit_id
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn state_dir(root: &Path, path: &Path, create: bool) -> Result<Option<Dir>, SyncError> {
@@ -332,6 +370,81 @@ mod tests {
     }
 
     #[test]
+    fn empty_first_connection_publishes_an_empty_root_commit() {
+        let tree = Tree::new();
+        let mut engine = tree.engine(MemoryRemoteStore::default());
+        assert!(matches!(
+            engine.synchronize().unwrap(),
+            SyncOutcome::Published
+        ));
+        let commits = engine.store().list_commits().unwrap();
+        assert_eq!(commits.len(), 1);
+        assert!(commits[0].entries.is_empty());
+        assert!(commits[0].parents.is_empty());
+        assert!(matches!(
+            engine.synchronize().unwrap(),
+            SyncOutcome::UpToDate
+        ));
+        assert_eq!(engine.store().list_commits().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn unchanged_and_local_only_syncs_do_not_download_history_objects() {
+        let tree = Tree::new();
+        tree.write("original", b"old object");
+        let mut engine = tree.engine(MemoryRemoteStore::default());
+        engine.synchronize().unwrap();
+        let old_hash: [u8; 32] = Sha256::digest(b"old object").into();
+        assert_eq!(engine.store().object_read_count(&old_hash), 1);
+
+        engine.synchronize().unwrap();
+        assert_eq!(engine.store().object_read_count(&old_hash), 1);
+
+        tree.write("new", b"new object");
+        engine.synchronize().unwrap();
+        assert_eq!(engine.store().object_read_count(&old_hash), 1);
+        let new_hash: [u8; 32] = Sha256::digest(b"new object").into();
+        assert_eq!(engine.store().object_read_count(&new_hash), 1);
+    }
+
+    #[test]
+    fn repeated_remote_hash_is_fetched_once_for_staging() {
+        let tree = Tree::new();
+        let mut store = MemoryRemoteStore::default();
+        let bytes = b"shared object";
+        let hash: [u8; 32] = Sha256::digest(bytes).into();
+        store.write_object(hash, bytes).unwrap();
+        let mut entries = BTreeMap::new();
+        for name in ["one", "two"] {
+            entries.insert(
+                RelativePath::new(&format!("touchHLE_apps/{name}")).unwrap(),
+                SnapshotEntry::File {
+                    sha256: hash,
+                    size: bytes.len() as u64,
+                    modified_unix_ms: 0,
+                },
+            );
+        }
+        store
+            .write_commit(&Commit {
+                id: Uuid::from_u128(17),
+                device_id: Uuid::nil(),
+                created_unix_ms: 0,
+                parents: vec![],
+                entries,
+            })
+            .unwrap();
+        let mut engine = tree.engine(store);
+        assert!(matches!(
+            engine.synchronize().unwrap(),
+            SyncOutcome::Applied
+        ));
+        assert_eq!(engine.store().object_read_count(&hash), 1);
+        assert_eq!(fs::read(tree.file("one")).unwrap(), bytes);
+        assert_eq!(fs::read(tree.file("two")).unwrap(), bytes);
+    }
+
+    #[test]
     fn empty_local_download_and_first_connection_conflict() {
         let source = Tree::new();
         source.write("same", b"same");
@@ -418,7 +531,7 @@ mod tests {
         producer.synchronize().unwrap();
         let target = Tree::new();
         let mut store = producer.into_store();
-        store.fail_after(StoreOperation::ReadObject, 1);
+        store.fail_next(StoreOperation::ReadObject);
         let mut engine = target.engine(store);
         assert!(engine.synchronize().is_err());
         assert!(!target.file("a").exists());
@@ -437,9 +550,15 @@ mod tests {
         let tree = Tree::new();
         tree.write("local", b"pending");
         let mut store = MemoryRemoteStore::default();
-        store.fail_after(StoreOperation::ReadObject, 1);
+        store.fail_next(StoreOperation::ReadObject);
         let mut engine = tree.engine(store);
-        assert!(engine.synchronize().is_err());
+        let first_attempt = engine.synchronize();
+        let pending_hash: [u8; 32] = Sha256::digest(b"pending").into();
+        assert!(
+            first_attempt.is_err(),
+            "result: {first_attempt:?}, reads: {}",
+            engine.store().object_read_count(&pending_hash)
+        );
         assert_eq!(engine.store().object_count(), 1);
         assert!(engine.store().list_commits().unwrap().is_empty());
         assert!(!tree.state().exists());
@@ -460,8 +579,8 @@ mod tests {
         let local = Tree::new();
         local.write("local", b"pending");
         let mut store = producer.into_store();
-        // The remote file is read for commit verification first, then staging.
-        store.fail_after(StoreOperation::ReadObject, 3);
+        // The newly uploaded local object is read back before staging fetches remote data.
+        store.fail_after(StoreOperation::ReadObject, 1);
         let mut engine = local.engine(store);
         assert!(engine.synchronize().is_err());
         assert_eq!(fs::read(local.file("local")).unwrap(), b"pending");
@@ -566,6 +685,117 @@ mod tests {
             SyncOutcome::Offline
         ));
         assert!(!tree.state().exists());
+    }
+
+    #[test]
+    fn missing_last_applied_history_is_rejected_without_publication_or_state_change() {
+        let tree = Tree::new();
+        tree.write("saved", b"baseline");
+        let mut engine = tree.engine(MemoryRemoteStore::default());
+        engine.synchronize().unwrap();
+        tree.write("pending", b"local change");
+        let saved_state = fs::read(tree.state()).unwrap();
+        let last_applied = serde_json::from_slice::<SyncState>(&saved_state)
+            .unwrap()
+            .last_applied_commit
+            .unwrap();
+        engine.store().remove_commit(&last_applied);
+
+        assert!(matches!(engine.synchronize(), Err(SyncError::Integrity(_))));
+        assert!(engine.store().list_commits().unwrap().is_empty());
+        assert_eq!(fs::read(tree.state()).unwrap(), saved_state);
+        assert_eq!(fs::read(tree.file("pending")).unwrap(), b"local change");
+    }
+
+    #[test]
+    fn unrelated_remote_tip_is_rejected_without_fresh_root_or_baseline_advance() {
+        let tree = Tree::new();
+        tree.write("saved", b"baseline");
+        let mut engine = tree.engine(MemoryRemoteStore::default());
+        engine.synchronize().unwrap();
+        let saved_state = fs::read(tree.state()).unwrap();
+        let mut foreign_entries = BTreeMap::new();
+        foreign_entries.insert(
+            RelativePath::new("touchHLE_apps/foreign").unwrap(),
+            file_entry_for_test(b"foreign"),
+        );
+        let foreign_hash: [u8; 32] = Sha256::digest(b"foreign").into();
+        engine
+            .store()
+            .write_object(foreign_hash, b"foreign")
+            .unwrap();
+        engine
+            .store()
+            .write_commit(&Commit {
+                id: Uuid::from_u128(99),
+                device_id: Uuid::from_u128(98),
+                created_unix_ms: 0,
+                parents: vec![],
+                entries: foreign_entries,
+            })
+            .unwrap();
+        tree.write("pending", b"local change");
+
+        assert!(matches!(engine.synchronize(), Err(SyncError::Integrity(_))));
+        assert_eq!(engine.store().list_commits().unwrap().len(), 2);
+        assert_eq!(fs::read(tree.state()).unwrap(), saved_state);
+        assert_eq!(fs::read(tree.file("pending")).unwrap(), b"local change");
+    }
+
+    #[test]
+    fn retry_after_own_publish_then_stage_failure_accepts_descendant_tip() {
+        let origin = Tree::new();
+        origin.write("base", b"common");
+        let mut seed = origin.engine(MemoryRemoteStore::default());
+        seed.synchronize().unwrap();
+        let shared_store = seed.into_store();
+
+        let local = Tree::new();
+        let mut local_engine = local.engine(shared_store.clone());
+        local_engine.synchronize().unwrap();
+        let baseline_id = serde_json::from_slice::<SyncState>(&fs::read(local.state()).unwrap())
+            .unwrap()
+            .last_applied_commit
+            .unwrap();
+
+        let remote = Tree::new();
+        let mut remote_engine = remote.engine(shared_store);
+        remote_engine.synchronize().unwrap();
+        remote.write("cloud", b"remote change");
+        assert!(matches!(
+            remote_engine.synchronize().unwrap(),
+            SyncOutcome::Published
+        ));
+        let remote_store = remote_engine.into_store();
+        local.write("device", b"local change");
+        let mut store = remote_store;
+        // Local upload read-back succeeds; fail the following staged download.
+        store.fail_after(StoreOperation::ReadObject, 1);
+        let mut engine = local.engine(store);
+        assert!(engine.synchronize().is_err());
+        let state_after_failure =
+            serde_json::from_slice::<SyncState>(&fs::read(local.state()).unwrap()).unwrap();
+        assert_eq!(state_after_failure.last_applied_commit, Some(baseline_id));
+        assert!(!local.file("cloud").exists());
+        assert_eq!(fs::read(local.file("device")).unwrap(), b"local change");
+
+        assert!(matches!(
+            engine.synchronize().unwrap(),
+            SyncOutcome::Applied
+        ));
+        assert_eq!(engine.store().list_commits().unwrap().len(), 3);
+        assert_eq!(fs::read(local.file("cloud")).unwrap(), b"remote change");
+        let final_state =
+            serde_json::from_slice::<SyncState>(&fs::read(local.state()).unwrap()).unwrap();
+        assert_ne!(final_state.last_applied_commit, Some(baseline_id));
+    }
+
+    fn file_entry_for_test(bytes: &[u8]) -> SnapshotEntry {
+        SnapshotEntry::File {
+            sha256: Sha256::digest(bytes).into(),
+            size: bytes.len() as u64,
+            modified_unix_ms: 0,
+        }
     }
 
     #[test]

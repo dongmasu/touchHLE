@@ -28,6 +28,7 @@ pub struct MemoryRemoteStore {
     objects: BTreeMap<[u8; 32], Vec<u8>>,
     commits: BTreeMap<Uuid, Commit>,
     failures: BTreeMap<StoreOperation, usize>,
+    object_reads: BTreeMap<[u8; 32], usize>,
 }
 
 impl MemoryRemoteStore {
@@ -64,6 +65,15 @@ impl MemoryRemoteStore {
     pub fn object_hashes(&self) -> Vec<[u8; 32]> {
         self.objects.keys().copied().collect()
     }
+
+    pub fn object_read_count(&self, hash: &[u8; 32]) -> usize {
+        self.object_reads.get(hash).copied().unwrap_or_default()
+    }
+
+    #[cfg(test)]
+    pub fn remove_commit(&mut self, id: &Uuid) {
+        self.commits.remove(id);
+    }
 }
 
 impl RemoteStore for MemoryRemoteStore {
@@ -73,6 +83,7 @@ impl RemoteStore for MemoryRemoteStore {
     }
 
     fn read_object(&mut self, hash: &[u8; 32]) -> Result<Option<Vec<u8>>, SyncError> {
+        *self.object_reads.entry(*hash).or_default() += 1;
         self.check(StoreOperation::ReadObject)?;
         Ok(self.objects.get(hash).cloned())
     }
