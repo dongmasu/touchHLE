@@ -17,6 +17,7 @@ pub struct RemoteTip {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RemoteVersion {
     pub commit_ids: Vec<Uuid>,
+    /// Representative metadata; use `remote_tips` for a selected source ID.
     pub entry: Option<SnapshotEntry>,
 }
 
@@ -109,15 +110,17 @@ impl SyncPlan {
             })?;
             let entry = match choice.selected {
                 LocalOrRemote::Local => conflict.local.as_ref(),
-                LocalOrRemote::Remote => conflict
-                    .remote_candidates
+                LocalOrRemote::Remote => self
+                    .remote_tips
                     .iter()
-                    .find(|candidate| {
-                        candidate
-                            .commit_ids
-                            .contains(&choice.remote_commit_id.unwrap())
+                    .find(|tip| Some(tip.commit_id) == choice.remote_commit_id)
+                    .ok_or_else(|| {
+                        SyncError::UnresolvedConflicts(format!(
+                            "remote tip unavailable for {}",
+                            conflict.path.as_str()
+                        ))
                     })
-                    .and_then(|candidate| candidate.entry.as_ref()),
+                    .map(|tip| tip.snapshot.get(&conflict.path))?,
             };
             resolved.insert(conflict.path.clone(), entry_for_action(entry));
         }
@@ -149,30 +152,6 @@ fn mismatched_prefix(left: &RelativePath, right: &RelativePath) -> bool {
         }
     }
     false
-}
-
-fn incompatible_paths(
-    left: (&RelativePath, &SnapshotEntry),
-    right: (&RelativePath, &SnapshotEntry),
-) -> bool {
-    if left.0 == right.0 {
-        return false;
-    }
-    let left_parts: Vec<_> = left.0.as_str().split('/').collect();
-    let right_parts: Vec<_> = right.0.as_str().split('/').collect();
-    for (a, b) in left_parts.iter().zip(&right_parts) {
-        if a.case_fold().collect::<String>() != b.case_fold().collect::<String>() {
-            return false;
-        }
-        if a != b {
-            return true;
-        }
-    }
-    if left_parts.len() < right_parts.len() {
-        matches!(left.1, SnapshotEntry::File { .. })
-    } else {
-        matches!(right.1, SnapshotEntry::File { .. })
-    }
 }
 
 fn validate_tree(entries: &BTreeMap<RelativePath, SnapshotEntry>) -> Result<(), SyncError> {
@@ -218,19 +197,83 @@ fn validate_tree(entries: &BTreeMap<RelativePath, SnapshotEntry>) -> Result<(), 
     Ok(())
 }
 
-fn mark_cross_tree_collisions(
-    left: &BTreeMap<RelativePath, SnapshotEntry>,
-    right: &BTreeMap<RelativePath, SnapshotEntry>,
+struct SnapshotIndex<'a> {
+    folded_prefixes: BTreeMap<String, BTreeMap<String, Vec<&'a RelativePath>>>,
+    live_files: BTreeMap<&'a str, &'a RelativePath>,
+}
+
+impl<'a> SnapshotIndex<'a> {
+    fn new(snapshot: &'a BTreeMap<RelativePath, SnapshotEntry>) -> Self {
+        let mut index = Self {
+            folded_prefixes: BTreeMap::new(),
+            live_files: BTreeMap::new(),
+        };
+        for (path, entry) in snapshot {
+            if matches!(entry, SnapshotEntry::File { .. }) {
+                index.live_files.insert(path.as_str(), path);
+            }
+            let mut prefix = String::new();
+            let mut folded = String::new();
+            for component in path.as_str().split('/') {
+                if !prefix.is_empty() {
+                    prefix.push('/');
+                    folded.push('/');
+                }
+                prefix.push_str(component);
+                folded.extend(component.case_fold());
+                index
+                    .folded_prefixes
+                    .entry(folded.clone())
+                    .or_default()
+                    .entry(prefix.clone())
+                    .or_default()
+                    .push(path);
+            }
+        }
+        index
+    }
+}
+
+fn mark_live_ancestors(
+    descendants: &SnapshotIndex<'_>,
+    ancestors: &SnapshotIndex<'_>,
     paths: &mut BTreeSet<RelativePath>,
 ) {
-    for l in left {
-        for r in right {
-            if incompatible_paths(l, r) {
-                paths.insert(l.0.clone());
-                paths.insert(r.0.clone());
+    for (&spelling, &descendant) in &descendants.live_files {
+        let mut prefix = spelling;
+        while let Some((parent, _)) = prefix.rsplit_once('/') {
+            if let Some(&ancestor) = ancestors.live_files.get(parent) {
+                paths.insert(descendant.clone());
+                paths.insert(ancestor.clone());
+            }
+            prefix = parent;
+        }
+    }
+}
+
+fn mark_cross_tree_collisions(
+    left: &SnapshotIndex<'_>,
+    right: &SnapshotIndex<'_>,
+    paths: &mut BTreeSet<RelativePath>,
+) {
+    // Each spelling bucket holds all paths beneath that prefix.
+    for (folded, left_spellings) in &left.folded_prefixes {
+        let Some(right_spellings) = right.folded_prefixes.get(folded) else {
+            continue;
+        };
+        for (spelling, affected) in left_spellings {
+            if right_spellings.len() > 1 || !right_spellings.contains_key(spelling) {
+                paths.extend(affected.iter().map(|path| (*path).clone()));
+            }
+        }
+        for (spelling, affected) in right_spellings {
+            if left_spellings.len() > 1 || !left_spellings.contains_key(spelling) {
+                paths.extend(affected.iter().map(|path| (*path).clone()));
             }
         }
     }
+    mark_live_ancestors(left, right, paths);
+    mark_live_ancestors(right, left, paths);
 }
 
 pub fn resolve_remote_tips(commits: &[Commit]) -> Result<Vec<RemoteTip>, SyncError> {
@@ -344,10 +387,15 @@ pub fn plan_sync(
         paths.extend(tip.snapshot.keys().cloned());
     }
     let mut structural_paths = BTreeSet::new();
-    for (index, tip) in tips.iter().enumerate() {
-        mark_cross_tree_collisions(local, &tip.snapshot, &mut structural_paths);
-        for later in &tips[index + 1..] {
-            mark_cross_tree_collisions(&tip.snapshot, &later.snapshot, &mut structural_paths);
+    let local_index = SnapshotIndex::new(local);
+    let tip_indexes: Vec<_> = tips
+        .iter()
+        .map(|tip| SnapshotIndex::new(&tip.snapshot))
+        .collect();
+    for (index, tip_index) in tip_indexes.iter().enumerate() {
+        mark_cross_tree_collisions(&local_index, tip_index, &mut structural_paths);
+        for later in &tip_indexes[index + 1..] {
+            mark_cross_tree_collisions(tip_index, later, &mut structural_paths);
         }
     }
     for path in paths {
@@ -646,6 +694,41 @@ mod tests {
         assert!(plan.apply_remote.is_empty());
         assert!(plan.publish_local.is_empty());
         assert!(plan.conflicts.is_empty());
+    }
+
+    #[test]
+    fn same_hash_remote_choice_uses_selected_tips_metadata() {
+        let baseline = snapshot(&[("entry", Some(file(1)))]);
+        let local = snapshot(&[("entry", Some(file(3)))]);
+        let newer = SnapshotEntry::File {
+            sha256: [2; 32],
+            size: 27,
+            modified_unix_ms: 400,
+        };
+        let plan = plan_sync(
+            &baseline,
+            &local,
+            &[
+                tip(2, &[("entry", Some(file(2)))]),
+                tip(3, &[("entry", Some(newer.clone()))]),
+            ],
+        )
+        .unwrap();
+        assert_eq!(plan.conflicts[0].remote_candidates.len(), 1);
+        assert_eq!(
+            plan.conflicts[0].remote_candidates[0].commit_ids,
+            vec![Uuid::from_u128(2), Uuid::from_u128(3)]
+        );
+        for (id, expected) in [(2, file(2)), (3, newer)] {
+            let resolved = plan
+                .resolved_snapshot(&[ConflictChoice {
+                    path: path("entry"),
+                    selected: LocalOrRemote::Remote,
+                    remote_commit_id: Some(Uuid::from_u128(id)),
+                }])
+                .unwrap();
+            assert_eq!(resolved.get(&path("entry")), Some(&expected));
+        }
     }
 
     #[test]
@@ -1194,5 +1277,126 @@ mod tests {
         let plan = plan_sync(&BTreeMap::new(), &local, &[remote]).unwrap();
         assert!(plan.conflicts.is_empty());
         assert_eq!(plan.apply_remote, snapshot(&[("a/b", Some(file(2)))]));
+    }
+
+    #[test]
+    fn exact_spelling_tombstone_descendants_do_not_create_structural_conflicts() {
+        for (local_name, local_entry, remote_name, remote_entry) in [
+            ("a", file(1), "a/b", SnapshotEntry::Tombstone),
+            ("a/b", SnapshotEntry::Tombstone, "a", file(1)),
+        ] {
+            let local = snapshot(&[(local_name, Some(local_entry))]);
+            let remote = tip(2, &[(remote_name, Some(remote_entry))]);
+            let plan = plan_sync(&BTreeMap::new(), &local, &[remote]).unwrap();
+            assert!(plan.conflicts.is_empty(), "{local_name} / {remote_name}");
+            if local_name == "a" {
+                assert!(plan.apply_remote.is_empty());
+                assert_eq!(plan.publish_local.get(&path("a")), Some(&file(1)));
+            } else {
+                assert!(plan.publish_local.is_empty());
+                assert_eq!(plan.apply_remote.get(&path("a")), Some(&file(1)));
+            }
+            let resolved = plan.resolved_snapshot(&[]).unwrap();
+            assert_eq!(
+                resolved.get(&path(local_name)),
+                local.get(&path(local_name))
+            );
+        }
+    }
+
+    #[test]
+    fn case_aliases_with_tombstones_still_require_explicit_choices() {
+        for (local_entry, remote_entry) in [
+            (file(1), SnapshotEntry::Tombstone),
+            (SnapshotEntry::Tombstone, file(2)),
+            (SnapshotEntry::Tombstone, SnapshotEntry::Tombstone),
+        ] {
+            let local = snapshot(&[("Save", Some(local_entry))]);
+            let remote = tip(2, &[("save", Some(remote_entry))]);
+            let plan = plan_sync(&BTreeMap::new(), &local, &[remote]).unwrap();
+            assert_eq!(
+                plan.conflicts
+                    .iter()
+                    .map(|conflict| &conflict.path)
+                    .collect::<Vec<_>>(),
+                vec![&path("Save"), &path("save")]
+            );
+            assert!(plan.apply_remote.is_empty());
+            assert!(plan.publish_local.is_empty());
+        }
+    }
+
+    #[test]
+    fn large_disjoint_trees_only_mark_the_actual_collisions() {
+        let mut local = BTreeMap::new();
+        let mut remote = BTreeMap::new();
+        for index in 0..1_500 {
+            local.insert(path(&format!("local-{index:04}")), file(1));
+            remote.insert(path(&format!("remote-{index:04}")), file(2));
+        }
+        local.insert(path("a"), file(3));
+        remote.insert(path("a/b"), file(4));
+        local.insert(path("Folder/one"), file(5));
+        remote.insert(path("folder/two"), file(6));
+
+        let plan = plan_sync(
+            &BTreeMap::new(),
+            &local,
+            &[RemoteTip {
+                commit_id: Uuid::from_u128(2),
+                snapshot: remote,
+            }],
+        )
+        .unwrap();
+        assert_eq!(
+            plan.conflicts
+                .iter()
+                .map(|conflict| conflict.path.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "touchHLE_apps/Folder/one",
+                "touchHLE_apps/a",
+                "touchHLE_apps/a/b",
+                "touchHLE_apps/folder/two",
+            ]
+        );
+        assert_eq!(plan.publish_local.len(), 1_500);
+        assert_eq!(plan.apply_remote.len(), 1_500);
+    }
+
+    #[test]
+    fn prefix_index_marks_every_colliding_descendant() {
+        let local = snapshot(&[
+            ("Folder/one", Some(file(1))),
+            ("Folder/two", Some(file(2))),
+            ("plain", Some(file(3))),
+        ]);
+        let remote = tip(
+            2,
+            &[
+                ("folder/three", Some(file(4))),
+                ("folder/four", Some(file(5))),
+                ("plain/one", Some(file(6))),
+                ("plain/two", Some(file(7))),
+            ],
+        );
+        let plan = plan_sync(&BTreeMap::new(), &local, &[remote]).unwrap();
+        assert!(plan.apply_remote.is_empty());
+        assert!(plan.publish_local.is_empty());
+        assert_eq!(
+            plan.conflicts
+                .iter()
+                .map(|conflict| conflict.path.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "touchHLE_apps/Folder/one",
+                "touchHLE_apps/Folder/two",
+                "touchHLE_apps/folder/four",
+                "touchHLE_apps/folder/three",
+                "touchHLE_apps/plain",
+                "touchHLE_apps/plain/one",
+                "touchHLE_apps/plain/two",
+            ]
+        );
     }
 }
