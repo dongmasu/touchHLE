@@ -747,6 +747,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "sha2"
+version = "0.10.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a7507d819769d01a365ab707794a4084392c824f54a7a6a7862f8c3d0892b283"
+dependencies = [
+ "cfg-if",
+ "cpufeatures",
+ "digest",
+]
+
+[[package]]
 name = "smallvec"
 version = "1.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1023,7 +1034,10 @@ dependencies = [
  "rusttype",
  "sdl2",
  "sdl2-sys",
+ "serde",
+ "serde_json",
  "sha1",
+ "sha2",
  "symphonia",
  "touchHLE_dynarmic_wrapper",
  "touchHLE_gl_bindings",
@@ -1031,6 +1045,7 @@ dependencies = [
  "touchHLE_pvrt_decompress_wrapper",
  "touchHLE_stb_image_wrapper",
  "touchHLE_version",
+ "unicode-casefold",
  "uuid",
  "windows-sys 0.61.0",
  "zip",
@@ -1089,6 +1104,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "562d481066bde0658276a35467c4af00bdc6ee726305698a55b86e61d7ad82bb"
 
 [[package]]
+name = "unicode-casefold"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b7f66b1c8f8caa2ab31dc6d3f35386f16efdab89668f93411e565ac368908e8f"
+
+[[package]]
 name = "unicode-ident"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1107,6 +1128,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "422ee0de9031b5b948b97a8fc04e3aa35230001a722ddd27943e0be31564ce4c"
 dependencies = [
  "getrandom",
+ "serde",
 ]
 
 [[package]]

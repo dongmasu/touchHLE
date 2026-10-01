@@ -49,6 +49,7 @@ mod objc;
 mod options;
 mod paths;
 mod stack;
+mod sync;
 mod window;
 
 // Environment is used very frequently used and used to be in this module, so
