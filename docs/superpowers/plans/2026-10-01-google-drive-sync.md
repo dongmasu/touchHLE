@@ -90,14 +90,16 @@ git commit -m "feat: add sync records and local scanner"
 
 **Interfaces:**
 - `RemoteTip`: a commit ID and its fully resolved snapshot.
-- `Conflict`: `{ path: RelativePath, local: Option<SnapshotEntry>, remote: Option<SnapshotEntry> }`.
-- `SyncPlan`: `{ apply_remote: BTreeMap<RelativePath, SnapshotEntry>, publish_local: BTreeMap<RelativePath, SnapshotEntry>, conflicts: Vec<Conflict>, merge_parents: Vec<Uuid>, local_snapshot: BTreeMap<RelativePath, SnapshotEntry>, remote_snapshot: BTreeMap<RelativePath, SnapshotEntry> }`.
+- `RemoteVersion`: `{ commit_ids: Vec<Uuid>, entry: Option<SnapshotEntry> }`; `None` means the path is absent from that snapshot.
+- `Conflict`: `{ path: RelativePath, local: Option<SnapshotEntry>, remote_candidates: Vec<RemoteVersion> }`.
+- `ConflictChoice`: `{ path: RelativePath, selected: LocalOrRemote, remote_commit_id: Option<Uuid> }`; a Remote choice names one of that path's candidate commit IDs, while a Local choice has no remote ID.
+- `SyncPlan`: `{ apply_remote: BTreeMap<RelativePath, SnapshotEntry>, publish_local: BTreeMap<RelativePath, SnapshotEntry>, conflicts: Vec<Conflict>, merge_parents: Vec<Uuid>, local_snapshot: BTreeMap<RelativePath, SnapshotEntry>, remote_tips: Vec<RemoteTip> }`.
 - `resolve_remote_tips(commits: &[Commit]) -> Result<Vec<RemoteTip>, SyncError>` validates parent references and cycles, derives all tip IDs, and materializes each tip's snapshot.
-- `plan_sync(baseline, local, remote_tips) -> Result<SyncPlan, SyncError>` computes one-sided changes, identical convergence, divergent tips, additions, and deletions.
+- `plan_sync(baseline, local, remote_tips) -> Result<SyncPlan, SyncError>` computes one-sided changes, identical convergence, divergent tips, additions, and deletions. When cloud tips disagree on a path, retain every distinct cloud version with its source commit IDs instead of collapsing them into one remote value.
 
 - [ ] **Step 1: Write table-driven planner tests**
 
-Cover unchanged files; local-only and remote-only modifications; matching edits on both sides; different edits to one path; local and remote additions; local and remote deletions; delete-versus-edit; two remote commits published from the same parent; missing parent IDs; and commit cycles.
+Cover unchanged files; local-only and remote-only modifications; matching edits on both sides; different edits to one path; local and remote additions; local and remote deletions; delete-versus-edit; two remote commits published from the same parent; two cloud tips with different edits to the same path; local-versus-multiple-cloud variants with every candidate retained; missing parent IDs; and commit cycles.
 
 - [ ] **Step 2: Run the planner tests and confirm the expected failures**
 
@@ -106,7 +108,7 @@ Expected: test compilation fails because `plan_sync` and planner types have not 
 
 - [ ] **Step 3: Implement deterministic three-way planning**
 
-Compare content hashes and tombstones against the baseline, not timestamps. Return conflicts sorted by `RelativePath`; retain every remote tip as a merge parent when producing a resolution.
+Compare content hashes and tombstones against the baseline, not timestamps. Return conflicts sorted by `RelativePath`, retain each distinct remote candidate and its source commit IDs, and retain every remote tip as a merge parent when producing a resolution.
 
 - [ ] **Step 4: Add merge ancestry tests and run the planner suite**
 
@@ -129,7 +131,7 @@ git commit -m "feat: plan three-way sync and conflicts"
 **Interfaces:**
 - `StagedFile`: validated relative path, temporary path, expected SHA-256, and destination.
 - `stage_remote_files(root, entries, read_object: impl Fn(&[u8; 32]) -> Result<Vec<u8>, SyncError>) -> Result<Vec<StagedFile>, SyncError>` downloads into a private staging directory and verifies each content hash before returning.
-- `apply_staged_files(root, staged, choices: &BTreeMap<RelativePath, LocalOrRemote>) -> Result<(), SyncError>` applies only selected remote versions using same-filesystem temporary files and atomic rename.
+- `apply_staged_files(root, staged) -> Result<(), SyncError>` applies only the already-selected remote entries using same-filesystem temporary files and atomic rename; the coordinator constructs this staged set from automatic changes and conflict choices.
 - `preserve_local_version(root, path, content_hash) -> Result<(), SyncError>` retains the replaced local version in `.touchHLE_sync/recovery/` before overwrite.
 
 - [ ] **Step 1: Add tests for integrity and path safety**
@@ -297,7 +299,7 @@ git commit -m "feat: add secure Google OAuth authentication"
 - `SyncMode`: `Disabled`, `Enabled`, or `Headless`; headless mode honors previously stored opt-in and credentials but never starts interactive authorization.
 - `SyncCoordinator::connect_account() -> Result<(), AuthError>` starts browser authorization and stores the resulting tokens using the platform adapter.
 - The app picker exposes Connect, Enable/Disable, and current sync status; local execution remains available if authorization is canceled or unavailable.
-- `SyncCoordinator::before_launch(mode: SyncMode) -> Result<PreLaunch, SyncError>` returns `Continue`, `NeedsResolution(SyncPlan)`, or `LocalOnly(reason)`; `SyncMode::Headless` carries headless behavior without a duplicate boolean.
+- `SyncCoordinator::before_launch(mode: SyncMode) -> Result<PreLaunch, SyncError>` returns `Continue`, `NeedsResolution(SyncPlan)`, or `LocalOnly(reason)`; `SyncMode::Headless` carries headless behavior without a duplicate boolean, and the full plan preserves every remote candidate.
 - `SyncCoordinator::after_exit() -> Result<SyncOutcome, SyncError>` snapshots and publishes local changes without preventing exit on offline/provider failure.
 
 - [ ] **Step 1: Add tests for persisted opt-in and account state**
@@ -409,19 +411,19 @@ git commit -m "feat: sync after guest exit"
 - Test: `src/sync/coordinator.rs`
 
 **Interfaces:**
-- `ConflictChoice`: `{ path: RelativePath, selected: LocalOrRemote }`.
-- `resolve_conflicts(plan: SyncPlan) -> Result<Vec<ConflictChoice>, SyncError>` displays the relative path, local/cloud labels, each side's file size and modification time, and one explicit choice per path. It is callable both before launch and after guest shutdown, with shutdown conflicts presented before `main` returns.
+- `ConflictChoice`: `{ path: RelativePath, selected: LocalOrRemote, remote_commit_id: Option<Uuid> }`.
+- `resolve_conflicts(plan: SyncPlan) -> Result<Vec<ConflictChoice>, SyncError>` displays the relative path, local state, and every distinct cloud candidate with size and modification time; one explicit choice is returned per path and a cloud choice names its source commit. It is callable both before launch and after guest shutdown, with shutdown conflicts presented before `main` returns.
 - A completed selection creates a merge commit with all resolved remote tip IDs as parents. The unselected object remains stored and recoverable.
 - `restore_version(path, commit_id) -> Result<(), SyncError>` lets the user restore a prior immutable version from the history view.
 - GUI construction remains on the existing app-picker thread; hashing and Drive transfers remain on a worker thread and report progress through a channel.
 
 - [ ] **Step 1: Add resolver model tests**
 
-Test one choice per conflict, preservation of unselected hashes, a merge commit whose parent list includes every conflicting remote tip, and restoration of a selected historical object.
+Test exactly one choice per path, selection of a specific candidate among multiple divergent cloud versions, preservation of every unselected hash, a merge commit whose parent list includes every remote tip, and restoration of a selected historical object.
 
 - [ ] **Step 2: Add the per-file UI to the app picker**
 
-Use existing UIKit-like controls and event polling. Display size in bytes and modification time in a stable local-time presentation; represent missing sides as “deleted”. Add a history view that can list retained versions for a path and invoke `restore_version`.
+Use existing UIKit-like controls and event polling. Display size in bytes and modification time in a stable local-time presentation for local and every cloud candidate; represent missing versions as “deleted”. Add a history view that can list retained versions for a path and invoke `restore_version`.
 
 - [ ] **Step 3: Test cancel and partial-resolution behavior**
 
