@@ -16,6 +16,7 @@
 - Support Android, desktop, graphical launches, and headless command-line launches.
 - Allow offline execution and retain local changes for later synchronization.
 - Synchronize before guest launch and after guest exit; never replace sandbox files while the guest is running.
+- Require exclusive local-tree writers during apply; a second process or external writer must not modify the synchronized roots until apply finishes.
 - Use immutable SHA-256 objects and append-only commits with parent IDs; do not introduce a shared mutable `HEAD`.
 - Compare local and remote state against the last successfully applied baseline; use tombstones for deletions.
 - Show each conflicting version's size and modification time and require a per-path choice.
@@ -339,6 +340,7 @@ git commit -m "feat: add sync opt-in and coordinator"
 - Resolve the selected app's local path only after startup sync has applied non-conflicting remote changes.
 - Graphical launches present pre-launch conflicts to the resolver before constructing the guest `Environment`.
 - Headless launches return a non-zero error before guest execution when conflicts require user input; print the graphical-mode resolution instruction.
+- Run local apply before guest construction, with no other process writing either synchronized root.
 
 - [ ] **Step 1: Add launch-flow tests around a fake coordinator**
 
@@ -376,6 +378,7 @@ git commit -m "feat: sync before guest launch"
 - Replace normal guest `std::process::exit` calls with an `Environment` exit request carrying an exit code.
 - Make `Environment::run` return the requested exit code after the guest coroutine and teardown complete.
 - Have `src/lib.rs::main` invoke `after_exit()` exactly once before returning to the binary entry point. If shutdown discovers conflicts, open the resolver in a fresh app-picker `Environment` after the guest environment returns but before `main` completes.
+- Apply shutdown changes only after guest teardown and while no other process writes the synchronized roots.
 - Keep fatal-abort paths distinct; never run guest lifecycle callbacks twice to trigger synchronization.
 
 - [ ] **Step 1: Add tests for guest exit request propagation**
@@ -413,6 +416,7 @@ git commit -m "feat: sync after guest exit"
 **Interfaces:**
 - `ConflictChoice`: `{ path: RelativePath, selected: LocalOrRemote, remote_commit_id: Option<Uuid> }`.
 - `resolve_conflicts(plan: SyncPlan) -> Result<Vec<ConflictChoice>, SyncError>` displays the relative path, local state, and every distinct cloud candidate with size and modification time; one explicit choice is returned per path and a cloud choice names its source commit. It is callable both before launch and after guest shutdown, with shutdown conflicts presented before `main` returns.
+- Validate all choices together through `SyncPlan::resolved_snapshot` before staging, applying, or committing. If structurally incompatible path choices produce an invalid tree, keep the files untouched and ask for a compatible selection.
 - A completed selection creates a merge commit with all resolved remote tip IDs as parents. The unselected object remains stored and recoverable.
 - `restore_version(path, commit_id) -> Result<(), SyncError>` lets the user restore a prior immutable version from the history view.
 - GUI construction remains on the existing app-picker thread; hashing and Drive transfers remain on a worker thread and report progress through a channel.
@@ -427,7 +431,7 @@ Use existing UIKit-like controls and event polling. Display size in bytes and mo
 
 - [ ] **Step 3: Test cancel and partial-resolution behavior**
 
-Cancel must leave local files, remote commits, and baseline unchanged. Applying choices must not drop unresolved conflicts or overwrite before verified staging succeeds.
+Cancel must leave local files, remote commits, and baseline unchanged. Applying choices must not drop unresolved conflicts or overwrite before verified staging succeeds. A set of individually valid but structurally incompatible choices must be rejected before any remote read or local write.
 
 - [ ] **Step 4: Run resolver tests and commit**
 

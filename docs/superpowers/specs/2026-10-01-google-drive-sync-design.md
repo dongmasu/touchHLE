@@ -133,6 +133,11 @@ Before launch:
 
 While the guest app runs, use only local files; do not replace sandbox files
 under a running app.
+The sync/apply sequence requires exclusive write access to these local trees:
+run it before guest construction or after guest teardown, and do not support
+another touchHLE instance or external process writing the same trees during
+apply. If an observed local file changes during apply, preserve the new bytes
+and abort without advancing the baseline.
 
 At app exit, snapshot local changes and attempt synchronization before the
 process terminates. Upload and verify immutable objects before publishing the
