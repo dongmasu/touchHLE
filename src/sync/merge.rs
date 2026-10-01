@@ -127,31 +127,64 @@ impl SyncPlan {
 
         // A tombstone for an old spelling cannot share a directory with a
         // selected file whose spelling differs only by case.
-        let live_paths: Vec<_> = resolved
-            .iter()
-            .filter_map(|(path, entry)| {
-                matches!(entry, SnapshotEntry::File { .. }).then_some(path.clone())
-            })
-            .collect();
+        let live_index = LiveSpellingIndex::new(&resolved);
         resolved.retain(|path, entry| {
-            !matches!(entry, SnapshotEntry::Tombstone)
-                || !live_paths.iter().any(|live| mismatched_prefix(path, live))
+            !matches!(entry, SnapshotEntry::Tombstone) || !live_index.has_mismatched_prefix(path)
         });
         validate_tree(&resolved)?;
         Ok(resolved)
     }
 }
 
-fn mismatched_prefix(left: &RelativePath, right: &RelativePath) -> bool {
-    for (left, right) in left.as_str().split('/').zip(right.as_str().split('/')) {
-        if left.case_fold().collect::<String>() != right.case_fold().collect::<String>() {
-            return false;
+struct LiveSpellingIndex {
+    prefixes: BTreeMap<String, BTreeSet<String>>,
+}
+
+impl LiveSpellingIndex {
+    fn new(entries: &BTreeMap<RelativePath, SnapshotEntry>) -> Self {
+        let mut prefixes = BTreeMap::<String, BTreeSet<String>>::new();
+        for (path, entry) in entries {
+            if !matches!(entry, SnapshotEntry::File { .. }) {
+                continue;
+            }
+            let mut spelling = String::new();
+            let mut folded = String::new();
+            for component in path.as_str().split('/') {
+                if !spelling.is_empty() {
+                    spelling.push('/');
+                    folded.push('/');
+                }
+                spelling.push_str(component);
+                folded.extend(component.case_fold());
+                prefixes
+                    .entry(folded.clone())
+                    .or_default()
+                    .insert(spelling.clone());
+            }
         }
-        if left != right {
-            return true;
-        }
+        Self { prefixes }
     }
-    false
+
+    fn has_mismatched_prefix(&self, path: &RelativePath) -> bool {
+        let mut spelling = String::new();
+        let mut folded = String::new();
+        for component in path.as_str().split('/') {
+            if !spelling.is_empty() {
+                spelling.push('/');
+                folded.push('/');
+            }
+            spelling.push_str(component);
+            folded.extend(component.case_fold());
+            if self
+                .prefixes
+                .get(&folded)
+                .is_some_and(|versions| versions.len() > 1 || !versions.contains(&spelling))
+            {
+                return true;
+            }
+        }
+        false
+    }
 }
 
 fn validate_tree(entries: &BTreeMap<RelativePath, SnapshotEntry>) -> Result<(), SyncError> {
@@ -1398,5 +1431,74 @@ mod tests {
                 "touchHLE_apps/plain/two",
             ]
         );
+    }
+
+    #[test]
+    fn live_prefix_index_distinguishes_aliases_from_exact_descendants() {
+        let live = snapshot(&[
+            ("Folder/live", Some(file(1))),
+            ("straße/live", Some(file(2))),
+            ("Save", Some(file(3))),
+        ]);
+        let index = LiveSpellingIndex::new(&live);
+        for alias in ["folder/old", "strasse/old", "save"] {
+            assert!(index.has_mismatched_prefix(&path(alias)), "{alias}");
+        }
+        for unchanged in ["Folder/old", "straße/old", "Save/child", "unrelated/old"] {
+            assert!(
+                !index.has_mismatched_prefix(&path(unchanged)),
+                "{unchanged}"
+            );
+        }
+    }
+
+    #[test]
+    fn large_mixed_resolution_keeps_only_nonaliased_tombstones() {
+        let mut local = BTreeMap::new();
+        for index in 0..1_200 {
+            local.insert(path(&format!("live-{index:04}")), file(1));
+            local.insert(
+                path(&format!("removed-{index:04}")),
+                SnapshotEntry::Tombstone,
+            );
+        }
+        local.extend(snapshot(&[
+            ("Folder/live", Some(file(2))),
+            ("Folder/old", Some(SnapshotEntry::Tombstone)),
+            ("straße/live", Some(file(3))),
+            ("Save", Some(file(4))),
+            ("Save/child", Some(SnapshotEntry::Tombstone)),
+            ("unrelated/deleted", Some(SnapshotEntry::Tombstone)),
+        ]));
+        let plan = SyncPlan {
+            apply_remote: snapshot(&[
+                ("folder/old", Some(SnapshotEntry::Tombstone)),
+                ("strasse/old", Some(SnapshotEntry::Tombstone)),
+                ("save", Some(SnapshotEntry::Tombstone)),
+            ]),
+            publish_local: BTreeMap::new(),
+            conflicts: Vec::new(),
+            merge_parents: Vec::new(),
+            local_snapshot: local,
+            remote_tips: Vec::new(),
+        };
+
+        let resolved = plan.resolved_snapshot(&[]).unwrap();
+        assert_eq!(resolved.len(), 2_406);
+        for alias in ["folder/old", "strasse/old", "save"] {
+            assert!(!resolved.contains_key(&path(alias)), "{alias}");
+        }
+        for kept in [
+            "Folder/old",
+            "Save/child",
+            "unrelated/deleted",
+            "removed-0199",
+        ] {
+            assert_eq!(
+                resolved.get(&path(kept)),
+                Some(&SnapshotEntry::Tombstone),
+                "{kept}"
+            );
+        }
     }
 }
