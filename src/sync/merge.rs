@@ -396,6 +396,33 @@ pub fn plan_sync(
     local: &BTreeMap<RelativePath, SnapshotEntry>,
     remote_tips: &[RemoteTip],
 ) -> Result<SyncPlan, SyncError> {
+    plan_sync_with_local_baseline(baseline, baseline, local, remote_tips)
+}
+
+pub fn plan_sync_with_local_baseline(
+    remote_baseline: &BTreeMap<RelativePath, SnapshotEntry>,
+    local_baseline: &BTreeMap<RelativePath, SnapshotEntry>,
+    local: &BTreeMap<RelativePath, SnapshotEntry>,
+    remote_tips: &[RemoteTip],
+) -> Result<SyncPlan, SyncError> {
+    plan_sync_internal(remote_baseline, local_baseline, local, remote_tips, false)
+}
+
+pub fn plan_sync_without_common_ancestor(
+    local_baseline: &BTreeMap<RelativePath, SnapshotEntry>,
+    local: &BTreeMap<RelativePath, SnapshotEntry>,
+    remote_tips: &[RemoteTip],
+) -> Result<SyncPlan, SyncError> {
+    plan_sync_internal(&BTreeMap::new(), local_baseline, local, remote_tips, true)
+}
+
+fn plan_sync_internal(
+    remote_baseline: &BTreeMap<RelativePath, SnapshotEntry>,
+    local_baseline: &BTreeMap<RelativePath, SnapshotEntry>,
+    local: &BTreeMap<RelativePath, SnapshotEntry>,
+    remote_tips: &[RemoteTip],
+    unrelated_roots: bool,
+) -> Result<SyncPlan, SyncError> {
     let mut tips = remote_tips.to_vec();
     tips.sort_by_key(|tip| tip.commit_id);
     for pair in tips.windows(2) {
@@ -415,7 +442,12 @@ pub fn plan_sync(
         remote_tips: tips.clone(),
     };
 
-    let mut paths: BTreeSet<_> = baseline.keys().chain(local.keys()).cloned().collect();
+    let mut paths: BTreeSet<_> = remote_baseline
+        .keys()
+        .chain(local_baseline.keys())
+        .chain(local.keys())
+        .cloned()
+        .collect();
     for tip in &tips {
         paths.extend(tip.snapshot.keys().cloned());
     }
@@ -432,7 +464,8 @@ pub fn plan_sync(
         }
     }
     for path in paths {
-        let base = baseline.get(&path);
+        let remote_base = remote_baseline.get(&path);
+        let local_base = local_baseline.get(&path);
         let current = local.get(&path);
         let mut candidates: Vec<RemoteVersion> = Vec::new();
         for tip in &tips {
@@ -452,9 +485,17 @@ pub fn plan_sync(
 
         let changed_candidates: Vec<_> = candidates
             .iter()
-            .filter(|candidate| !same_content(base, candidate.entry.as_ref()))
+            .filter(|candidate| !same_content(remote_base, candidate.entry.as_ref()))
             .collect();
+        let unrelated_file_tombstone = unrelated_roots
+            && candidates.iter().any(|candidate| {
+                matches!(candidate.entry.as_ref(), Some(SnapshotEntry::File { .. }))
+            })
+            && candidates
+                .iter()
+                .any(|candidate| candidate.entry.as_ref() == Some(&SnapshotEntry::Tombstone));
         if structural_paths.contains(&path)
+            || unrelated_file_tombstone
             || changed_candidates.iter().skip(1).any(|candidate| {
                 !same_content(
                     changed_candidates[0].entry.as_ref(),
@@ -471,9 +512,9 @@ pub fn plan_sync(
         }
         let remote = changed_candidates
             .first()
-            .map_or(base, |candidate| candidate.entry.as_ref());
-        let local_changed = !same_content(base, current);
-        let remote_changed = !changed_candidates.is_empty();
+            .map_or(remote_base, |candidate| candidate.entry.as_ref());
+        let local_changed = !same_content(local_base, current);
+        let remote_changed = !same_content(local_base, remote);
         if local_changed && remote_changed && !same_content(current, remote) {
             plan.conflicts.push(Conflict {
                 path,

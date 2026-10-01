@@ -4,7 +4,10 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 use super::apply::{apply_staged_files, stage_remote_files};
-use super::merge::{plan_sync, resolve_remote_tips, Conflict, RemoteTip, RemoteVersion, SyncPlan};
+use super::merge::{
+    plan_sync, plan_sync_with_local_baseline, plan_sync_without_common_ancestor,
+    resolve_remote_tips, Conflict, RemoteTip, RemoteVersion, SyncPlan,
+};
 use super::model::{Commit, RelativePath, SnapshotEntry, SyncError, SyncState};
 use super::scan::scan_roots;
 use super::store::RemoteStore;
@@ -64,13 +67,24 @@ impl<S: RemoteStore> SyncEngine<S> {
         validate_baseline_present(state.last_applied_commit, &commits)?;
         // Include the saved commit as an ancestry anchor but compare sibling
         // tips from their shared base so changes on both branches conflict.
+        let empty_baseline = BTreeMap::new();
+        let local_baseline = if state.last_applied_commit.is_some() {
+            &state.baseline
+        } else {
+            &empty_baseline
+        };
         let plan = match select_planning_base(
             state.last_applied_commit,
             &state.baseline,
             &commits,
             &tips,
         )? {
-            PlanningBase::Snapshot(snapshot) => plan_sync(&snapshot, &local, &tips)?,
+            PlanningBase::Snapshot(snapshot) => {
+                plan_sync_with_local_baseline(&snapshot, local_baseline, &local, &tips)?
+            }
+            PlanningBase::Unrelated => {
+                plan_sync_without_common_ancestor(local_baseline, &local, &tips)?
+            }
             PlanningBase::Ambiguous => conservative_conflict_plan(&local, &tips)?,
         };
         if !plan.conflicts.is_empty() {
@@ -185,6 +199,7 @@ fn validate_baseline_present(
 
 enum PlanningBase {
     Snapshot(BTreeMap<RelativePath, SnapshotEntry>),
+    Unrelated,
     Ambiguous,
 }
 
@@ -228,9 +243,7 @@ fn select_planning_base(
     }
     let common = common.unwrap_or_default();
     if common.is_empty() {
-        // No common ancestry is expected for clients that initialized while
-        // the remote store was empty. Compare from a virtual empty snapshot.
-        return Ok(PlanningBase::Snapshot(BTreeMap::new()));
+        return Ok(PlanningBase::Unrelated);
     }
 
     let mut non_maximal = std::collections::BTreeSet::new();
@@ -702,7 +715,7 @@ mod tests {
     }
 
     #[test]
-    fn conflict_free_merge_publishes_all_tip_parents() {
+    fn unrelated_disjoint_genesis_roots_auto_merge() {
         let tree = Tree::new();
         let mut store = MemoryRemoteStore::default();
         let first = b"first";
@@ -849,7 +862,89 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_initial_roots_are_retained_as_conflict_candidates() {
+    fn fresh_empty_device_downloads_unchanged_file_from_shared_base() {
+        let (_, store, _, _) = sibling_branches("left", b"left edit", "right", b"right edit");
+        let fresh = Tree::new();
+        let mut engine = fresh.engine(store);
+
+        engine.synchronize().unwrap();
+        assert_eq!(
+            fs::read(fresh.file("base")).unwrap(),
+            b"common ancestor",
+            "empty first-connection state must not turn shared cloud content into a tombstone"
+        );
+        let tips = resolve_remote_tips(&engine.store().list_commits().unwrap()).unwrap();
+        assert!(tips.iter().all(|tip| {
+            !matches!(
+                tip.snapshot
+                    .get(&RelativePath::new("touchHLE_apps/base").unwrap()),
+                Some(SnapshotEntry::Tombstone)
+            )
+        }));
+        assert!(fresh.state().exists());
+        assert!(matches!(
+            tips[0]
+                .snapshot
+                .get(&RelativePath::new("touchHLE_apps/base").unwrap()),
+            Some(SnapshotEntry::File { .. })
+        ));
+    }
+
+    #[test]
+    fn offline_deletion_against_sibling_tip_is_not_resurrected() {
+        let origin = Tree::new();
+        let mut seed = origin.engine(MemoryRemoteStore::default());
+        seed.synchronize().unwrap();
+        let shared = seed.into_store();
+
+        let local = Tree::new();
+        let mut local_engine = local.engine(shared.clone());
+        local_engine.synchronize().unwrap();
+        local.write("x", b"branch A");
+        local_engine.synchronize().unwrap();
+        let saved_state = fs::read(local.state()).unwrap();
+        let mut local_store = local_engine.into_store();
+
+        let remote = Tree::new();
+        let mut remote_engine = remote.engine(shared);
+        remote_engine.synchronize().unwrap();
+        remote.write("other", b"branch B");
+        remote_engine.synchronize().unwrap();
+        let mut combined = remote_engine.into_store();
+        for hash in local_store.object_hashes() {
+            if combined.read_object(&hash).unwrap().is_none() {
+                combined
+                    .write_object(hash, &local_store.read_object(&hash).unwrap().unwrap())
+                    .unwrap();
+            }
+        }
+        for commit in local_store.list_commits().unwrap() {
+            combined.write_commit(&commit).unwrap();
+        }
+        fs::remove_file(local.file("x")).unwrap();
+        let mut engine = local.engine(combined);
+
+        match engine.synchronize().unwrap() {
+            SyncOutcome::Conflicts(_) => {
+                assert!(!local.file("x").exists());
+                assert_eq!(fs::read(local.state()).unwrap(), saved_state);
+            }
+            SyncOutcome::Published => {
+                assert!(!local.file("x").exists());
+                let tips = resolve_remote_tips(&engine.store().list_commits().unwrap()).unwrap();
+                assert!(matches!(
+                    tips[0]
+                        .snapshot
+                        .get(&RelativePath::new("touchHLE_apps/x").unwrap()),
+                    Some(SnapshotEntry::Tombstone)
+                ));
+            }
+            other => panic!("offline deletion must not be auto-overwritten: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unrelated_same_path_different_files_require_explicit_choice() {
         let first = Tree::new();
         let second = Tree::new();
         first.write("save", b"first root");
@@ -886,6 +981,29 @@ mod tests {
             .any(|tip| tip.commit_id == second_id));
         assert_eq!(plan.conflicts.len(), 1);
         assert_eq!(plan.conflicts[0].remote_candidates.len(), 2);
+        let candidate_ids: std::collections::BTreeSet<_> = plan.conflicts[0]
+            .remote_candidates
+            .iter()
+            .flat_map(|candidate| candidate.commit_ids.iter().copied())
+            .collect();
+        assert_eq!(candidate_ids, [first_id, second_id].into_iter().collect());
+        let candidate_hashes: std::collections::BTreeSet<_> = plan.conflicts[0]
+            .remote_candidates
+            .iter()
+            .filter_map(|candidate| match candidate.entry.as_ref() {
+                Some(SnapshotEntry::File { sha256, .. }) => Some(*sha256),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            candidate_hashes,
+            [
+                Sha256::digest(b"first root").into(),
+                Sha256::digest(b"second root").into()
+            ]
+            .into_iter()
+            .collect()
+        );
         assert!(matches!(
             plan.resolved_snapshot(&[]),
             Err(SyncError::UnresolvedConflicts(_))
@@ -893,6 +1011,68 @@ mod tests {
         assert_eq!(engine.store().list_commits().unwrap().len(), 2);
         assert_eq!(fs::read(first.state()).unwrap(), saved_state);
         assert_eq!(fs::read(first.file("save")).unwrap(), b"first root");
+    }
+
+    #[test]
+    fn unrelated_file_and_tombstone_roots_require_an_explicit_choice() {
+        let tree = Tree::new();
+        let path = RelativePath::new("touchHLE_apps/x").unwrap();
+        let bytes = b"file root";
+        let hash: [u8; 32] = Sha256::digest(bytes).into();
+        let file_id = Uuid::from_u128(901);
+        let tombstone_id = Uuid::from_u128(902);
+        let mut store = MemoryRemoteStore::default();
+        store.write_object(hash, bytes).unwrap();
+        store
+            .write_commit(&Commit {
+                id: file_id,
+                device_id: Uuid::from_u128(911),
+                created_unix_ms: 0,
+                parents: vec![],
+                entries: BTreeMap::from([(path.clone(), file_entry_for_test(bytes))]),
+            })
+            .unwrap();
+        store
+            .write_commit(&Commit {
+                id: tombstone_id,
+                device_id: Uuid::from_u128(912),
+                created_unix_ms: 0,
+                parents: vec![],
+                entries: BTreeMap::from([(path.clone(), SnapshotEntry::Tombstone)]),
+            })
+            .unwrap();
+        let mut engine = tree.engine(store);
+
+        let SyncOutcome::Conflicts(plan) = engine.synchronize().unwrap() else {
+            panic!("file-versus-tombstone genesis disagreement must not auto-resolve");
+        };
+        let conflict = plan
+            .conflicts
+            .iter()
+            .find(|conflict| conflict.path == path)
+            .unwrap();
+        assert_eq!(conflict.remote_candidates.len(), 2);
+        assert!(conflict.remote_candidates.iter().any(|candidate| {
+            candidate.commit_ids == vec![file_id]
+                && candidate.entry.as_ref() == Some(&file_entry_for_test(bytes))
+        }));
+        assert!(conflict.remote_candidates.iter().any(|candidate| {
+            candidate.commit_ids == vec![tombstone_id]
+                && candidate.entry == Some(SnapshotEntry::Tombstone)
+        }));
+        let candidate_ids: std::collections::BTreeSet<_> = conflict
+            .remote_candidates
+            .iter()
+            .flat_map(|candidate| candidate.commit_ids.iter().copied())
+            .collect();
+        assert_eq!(candidate_ids, [file_id, tombstone_id].into_iter().collect());
+        assert!(matches!(
+            plan.resolved_snapshot(&[]),
+            Err(SyncError::UnresolvedConflicts(_))
+        ));
+        assert_eq!(engine.store().list_commits().unwrap().len(), 2);
+        assert!(!tree.file("x").exists());
+        assert!(!tree.state().exists());
     }
 
     #[test]
