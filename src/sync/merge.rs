@@ -5,6 +5,7 @@
  */
 use super::model::{Commit, LocalOrRemote, RelativePath, SnapshotEntry, SyncError};
 use std::collections::{BTreeMap, BTreeSet};
+use unicode_casefold::UnicodeCaseFold;
 use uuid::Uuid;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -71,6 +72,165 @@ pub struct SyncPlan {
     pub merge_parents: Vec<Uuid>,
     pub local_snapshot: BTreeMap<RelativePath, SnapshotEntry>,
     pub remote_tips: Vec<RemoteTip>,
+}
+
+impl SyncPlan {
+    /// Call before staging, applying, or committing any plan actions.
+    /// Individual choices alone cannot establish a valid combined tree.
+    pub fn resolved_snapshot(
+        &self,
+        choices: &[ConflictChoice],
+    ) -> Result<BTreeMap<RelativePath, SnapshotEntry>, SyncError> {
+        let mut selections = BTreeMap::new();
+        for choice in choices {
+            choice.validate(self)?;
+            if selections.insert(&choice.path, choice).is_some() {
+                return Err(SyncError::UnresolvedConflicts(format!(
+                    "duplicate choice at {}",
+                    choice.path.as_str()
+                )));
+            }
+        }
+        if selections.len() != self.conflicts.len() {
+            return Err(SyncError::UnresolvedConflicts(
+                "a choice is required for every conflict".to_owned(),
+            ));
+        }
+
+        let mut resolved = self.local_snapshot.clone();
+        resolved.extend(self.publish_local.clone());
+        resolved.extend(self.apply_remote.clone());
+        for conflict in &self.conflicts {
+            let choice = selections.get(&conflict.path).ok_or_else(|| {
+                SyncError::UnresolvedConflicts(format!(
+                    "missing choice at {}",
+                    conflict.path.as_str()
+                ))
+            })?;
+            let entry = match choice.selected {
+                LocalOrRemote::Local => conflict.local.as_ref(),
+                LocalOrRemote::Remote => conflict
+                    .remote_candidates
+                    .iter()
+                    .find(|candidate| {
+                        candidate
+                            .commit_ids
+                            .contains(&choice.remote_commit_id.unwrap())
+                    })
+                    .and_then(|candidate| candidate.entry.as_ref()),
+            };
+            resolved.insert(conflict.path.clone(), entry_for_action(entry));
+        }
+
+        // A tombstone for an old spelling cannot share a directory with a
+        // selected file whose spelling differs only by case.
+        let live_paths: Vec<_> = resolved
+            .iter()
+            .filter_map(|(path, entry)| {
+                matches!(entry, SnapshotEntry::File { .. }).then_some(path.clone())
+            })
+            .collect();
+        resolved.retain(|path, entry| {
+            !matches!(entry, SnapshotEntry::Tombstone)
+                || !live_paths.iter().any(|live| mismatched_prefix(path, live))
+        });
+        validate_tree(&resolved)?;
+        Ok(resolved)
+    }
+}
+
+fn mismatched_prefix(left: &RelativePath, right: &RelativePath) -> bool {
+    for (left, right) in left.as_str().split('/').zip(right.as_str().split('/')) {
+        if left.case_fold().collect::<String>() != right.case_fold().collect::<String>() {
+            return false;
+        }
+        if left != right {
+            return true;
+        }
+    }
+    false
+}
+
+fn incompatible_paths(
+    left: (&RelativePath, &SnapshotEntry),
+    right: (&RelativePath, &SnapshotEntry),
+) -> bool {
+    if left.0 == right.0 {
+        return false;
+    }
+    let left_parts: Vec<_> = left.0.as_str().split('/').collect();
+    let right_parts: Vec<_> = right.0.as_str().split('/').collect();
+    for (a, b) in left_parts.iter().zip(&right_parts) {
+        if a.case_fold().collect::<String>() != b.case_fold().collect::<String>() {
+            return false;
+        }
+        if a != b {
+            return true;
+        }
+    }
+    if left_parts.len() < right_parts.len() {
+        matches!(left.1, SnapshotEntry::File { .. })
+    } else {
+        matches!(right.1, SnapshotEntry::File { .. })
+    }
+}
+
+fn validate_tree(entries: &BTreeMap<RelativePath, SnapshotEntry>) -> Result<(), SyncError> {
+    let mut spellings = BTreeMap::<String, String>::new();
+    let live: BTreeSet<_> = entries
+        .iter()
+        .filter_map(|(path, entry)| {
+            matches!(entry, SnapshotEntry::File { .. }).then_some(path.as_str())
+        })
+        .collect();
+    for path in entries.keys() {
+        let mut prefix = String::new();
+        for component in path.as_str().split('/') {
+            if !prefix.is_empty() {
+                prefix.push('/');
+            }
+            prefix.push_str(component);
+            let folded = prefix.as_str().case_fold().collect::<String>();
+            if let Some(previous) = spellings.insert(folded, prefix.clone()) {
+                if previous != prefix {
+                    return Err(SyncError::UnresolvedConflicts(format!(
+                        "case-insensitive path collision: {previous} and {prefix}"
+                    )));
+                }
+            }
+        }
+    }
+    for (path, entry) in entries {
+        if !matches!(entry, SnapshotEntry::File { .. }) {
+            continue;
+        }
+        let mut current = path.as_str();
+        while let Some((parent, _)) = current.rsplit_once('/') {
+            if live.contains(parent) {
+                return Err(SyncError::UnresolvedConflicts(format!(
+                    "file/descendant collision: {parent} and {}",
+                    path.as_str()
+                )));
+            }
+            current = parent;
+        }
+    }
+    Ok(())
+}
+
+fn mark_cross_tree_collisions(
+    left: &BTreeMap<RelativePath, SnapshotEntry>,
+    right: &BTreeMap<RelativePath, SnapshotEntry>,
+    paths: &mut BTreeSet<RelativePath>,
+) {
+    for l in left {
+        for r in right {
+            if incompatible_paths(l, r) {
+                paths.insert(l.0.clone());
+                paths.insert(r.0.clone());
+            }
+        }
+    }
 }
 
 pub fn resolve_remote_tips(commits: &[Commit]) -> Result<Vec<RemoteTip>, SyncError> {
@@ -183,6 +343,13 @@ pub fn plan_sync(
     for tip in &tips {
         paths.extend(tip.snapshot.keys().cloned());
     }
+    let mut structural_paths = BTreeSet::new();
+    for (index, tip) in tips.iter().enumerate() {
+        mark_cross_tree_collisions(local, &tip.snapshot, &mut structural_paths);
+        for later in &tips[index + 1..] {
+            mark_cross_tree_collisions(&tip.snapshot, &later.snapshot, &mut structural_paths);
+        }
+    }
     for path in paths {
         let base = baseline.get(&path);
         let current = local.get(&path);
@@ -206,12 +373,14 @@ pub fn plan_sync(
             .iter()
             .filter(|candidate| !same_content(base, candidate.entry.as_ref()))
             .collect();
-        if changed_candidates.iter().skip(1).any(|candidate| {
-            !same_content(
-                changed_candidates[0].entry.as_ref(),
-                candidate.entry.as_ref(),
-            )
-        }) {
+        if structural_paths.contains(&path)
+            || changed_candidates.iter().skip(1).any(|candidate| {
+                !same_content(
+                    changed_candidates[0].entry.as_ref(),
+                    candidate.entry.as_ref(),
+                )
+            })
+        {
             plan.conflicts.push(Conflict {
                 path,
                 local: current.cloned(),
@@ -734,5 +903,296 @@ mod tests {
             ),
             Err(SyncError::Integrity(_))
         ));
+    }
+
+    #[test]
+    fn file_and_descendant_in_opposite_trees_require_compatible_path_choices() {
+        for (local_name, remote_name) in [("a", "a/b"), ("a/b", "a")] {
+            let local = snapshot(&[(local_name, Some(file(1)))]);
+            let remote = tip(2, &[(remote_name, Some(file(2)))]);
+            let plan = plan_sync(&BTreeMap::new(), &local, &[remote.clone()]).unwrap();
+            assert!(plan.apply_remote.is_empty());
+            assert!(plan.publish_local.is_empty());
+            assert_eq!(
+                plan.conflicts.iter().map(|c| &c.path).collect::<Vec<_>>(),
+                vec![&path("a"), &path("a/b")]
+            );
+            let remote_at_local = &plan
+                .conflicts
+                .iter()
+                .find(|c| c.path == path(local_name))
+                .unwrap()
+                .remote_candidates;
+            assert_eq!(
+                remote_at_local,
+                &vec![RemoteVersion {
+                    commit_ids: vec![remote.commit_id],
+                    entry: None,
+                }]
+            );
+            let remote_at_remote = &plan
+                .conflicts
+                .iter()
+                .find(|c| c.path == path(remote_name))
+                .unwrap()
+                .remote_candidates;
+            assert_eq!(
+                remote_at_remote,
+                &vec![RemoteVersion {
+                    commit_ids: vec![remote.commit_id],
+                    entry: Some(file(2)),
+                }]
+            );
+            let choices = [
+                ConflictChoice {
+                    path: path(local_name),
+                    selected: LocalOrRemote::Local,
+                    remote_commit_id: None,
+                },
+                ConflictChoice {
+                    path: path(remote_name),
+                    selected: LocalOrRemote::Remote,
+                    remote_commit_id: Some(remote.commit_id),
+                },
+            ];
+            assert!(matches!(
+                plan.resolved_snapshot(&choices),
+                Err(SyncError::UnresolvedConflicts(_))
+            ));
+            let keep_local = [
+                ConflictChoice {
+                    path: path(local_name),
+                    selected: LocalOrRemote::Local,
+                    remote_commit_id: None,
+                },
+                ConflictChoice {
+                    path: path(remote_name),
+                    selected: LocalOrRemote::Local,
+                    remote_commit_id: None,
+                },
+            ];
+            assert_eq!(
+                plan.resolved_snapshot(&keep_local)
+                    .unwrap()
+                    .get(&path(local_name)),
+                Some(&file(1))
+            );
+            let keep_remote = [
+                ConflictChoice {
+                    path: path(local_name),
+                    selected: LocalOrRemote::Remote,
+                    remote_commit_id: Some(remote.commit_id),
+                },
+                ConflictChoice {
+                    path: path(remote_name),
+                    selected: LocalOrRemote::Remote,
+                    remote_commit_id: Some(remote.commit_id),
+                },
+            ];
+            assert_eq!(
+                plan.resolved_snapshot(&keep_remote)
+                    .unwrap()
+                    .get(&path(remote_name)),
+                Some(&file(2))
+            );
+            assert_eq!(plan.merge_parents, vec![remote.commit_id]);
+            assert_eq!(plan.local_snapshot, local);
+            assert_eq!(plan.remote_tips, vec![remote]);
+        }
+    }
+
+    #[test]
+    fn cross_tree_case_collisions_require_compatible_path_choices() {
+        for (local_name, remote_name) in [
+            ("Save", "save"),
+            ("straße", "strasse"),
+            ("Save/one", "save/two"),
+            ("Save", "save/child"),
+            ("Save/child", "save"),
+        ] {
+            let local = snapshot(&[(local_name, Some(file(1)))]);
+            let remote = tip(2, &[(remote_name, Some(file(2)))]);
+            let plan = plan_sync(&BTreeMap::new(), &local, &[remote]).unwrap();
+            assert!(plan.apply_remote.is_empty(), "{local_name} / {remote_name}");
+            assert!(
+                plan.publish_local.is_empty(),
+                "{local_name} / {remote_name}"
+            );
+            assert_eq!(plan.conflicts.len(), 2, "{local_name} / {remote_name}");
+            let incompatible = [
+                ConflictChoice {
+                    path: path(local_name),
+                    selected: LocalOrRemote::Local,
+                    remote_commit_id: None,
+                },
+                ConflictChoice {
+                    path: path(remote_name),
+                    selected: LocalOrRemote::Remote,
+                    remote_commit_id: Some(Uuid::from_u128(2)),
+                },
+            ];
+            assert!(
+                plan.resolved_snapshot(&incompatible).is_err(),
+                "{local_name} / {remote_name}"
+            );
+            let local_choices = [
+                ConflictChoice {
+                    path: path(local_name),
+                    selected: LocalOrRemote::Local,
+                    remote_commit_id: None,
+                },
+                ConflictChoice {
+                    path: path(remote_name),
+                    selected: LocalOrRemote::Local,
+                    remote_commit_id: None,
+                },
+            ];
+            let selected_local = plan.resolved_snapshot(&local_choices).unwrap();
+            assert_eq!(selected_local.get(&path(local_name)), Some(&file(1)));
+            assert!(!selected_local.contains_key(&path(remote_name)));
+            let remote_choices = [
+                ConflictChoice {
+                    path: path(local_name),
+                    selected: LocalOrRemote::Remote,
+                    remote_commit_id: Some(Uuid::from_u128(2)),
+                },
+                ConflictChoice {
+                    path: path(remote_name),
+                    selected: LocalOrRemote::Remote,
+                    remote_commit_id: Some(Uuid::from_u128(2)),
+                },
+            ];
+            let selected_remote = plan.resolved_snapshot(&remote_choices).unwrap();
+            assert_eq!(selected_remote.get(&path(remote_name)), Some(&file(2)));
+            assert!(!selected_remote.contains_key(&path(local_name)));
+        }
+    }
+
+    #[test]
+    fn all_conflict_choices_are_required_once_before_resolution() {
+        let plan = plan_sync(
+            &BTreeMap::new(),
+            &snapshot(&[("a", Some(file(1)))]),
+            &[tip(2, &[("a/b", Some(file(2)))])],
+        )
+        .unwrap();
+        let choice = ConflictChoice {
+            path: path("a"),
+            selected: LocalOrRemote::Local,
+            remote_commit_id: None,
+        };
+        assert!(plan.resolved_snapshot(&[]).is_err());
+        assert!(plan.resolved_snapshot(&[choice.clone()]).is_err());
+        assert!(plan.resolved_snapshot(&[choice.clone(), choice]).is_err());
+    }
+
+    #[test]
+    fn resolved_snapshot_preserves_noncolliding_deletion_tombstones() {
+        let baseline = snapshot(&[("entry", Some(file(1)))]);
+        let local = snapshot(&[("entry", Some(file(2)))]);
+        let plan = plan_sync(&baseline, &local, &[tip(2, &[("entry", None)])]).unwrap();
+        let resolved = plan
+            .resolved_snapshot(&[ConflictChoice {
+                path: path("entry"),
+                selected: LocalOrRemote::Remote,
+                remote_commit_id: Some(Uuid::from_u128(2)),
+            }])
+            .unwrap();
+        assert_eq!(
+            resolved.get(&path("entry")),
+            Some(&SnapshotEntry::Tombstone)
+        );
+    }
+
+    #[test]
+    fn structural_conflicts_block_overlapping_actions_but_not_unrelated_changes() {
+        let local = snapshot(&[("a", Some(file(1))), ("free", Some(file(4)))]);
+        let tips = [
+            tip(2, &[("a/b", Some(file(2))), ("remote", Some(file(3)))]),
+            tip(3, &[("a/c", Some(file(5))), ("remote", Some(file(3)))]),
+        ];
+        let plan = plan_sync(&BTreeMap::new(), &local, &tips).unwrap();
+        assert_eq!(
+            plan.conflicts
+                .iter()
+                .map(|c| c.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["touchHLE_apps/a", "touchHLE_apps/a/b", "touchHLE_apps/a/c"]
+        );
+        assert_eq!(
+            plan.conflicts[1].remote_candidates,
+            vec![
+                RemoteVersion {
+                    commit_ids: vec![Uuid::from_u128(2)],
+                    entry: Some(file(2))
+                },
+                RemoteVersion {
+                    commit_ids: vec![Uuid::from_u128(3)],
+                    entry: None
+                },
+            ]
+        );
+        assert_eq!(plan.publish_local, snapshot(&[("free", Some(file(4)))]));
+        assert_eq!(plan.apply_remote, snapshot(&[("remote", Some(file(3)))]));
+        assert_eq!(
+            plan.merge_parents,
+            vec![Uuid::from_u128(2), Uuid::from_u128(3)]
+        );
+        let choices = [
+            ConflictChoice {
+                path: path("a"),
+                selected: LocalOrRemote::Remote,
+                remote_commit_id: Some(Uuid::from_u128(2)),
+            },
+            ConflictChoice {
+                path: path("a/b"),
+                selected: LocalOrRemote::Remote,
+                remote_commit_id: Some(Uuid::from_u128(2)),
+            },
+            ConflictChoice {
+                path: path("a/c"),
+                selected: LocalOrRemote::Remote,
+                remote_commit_id: Some(Uuid::from_u128(2)),
+            },
+        ];
+        assert_eq!(
+            plan.resolved_snapshot(&choices).unwrap().get(&path("a/b")),
+            Some(&file(2))
+        );
+    }
+
+    #[test]
+    fn incompatible_remote_tips_without_local_files_are_not_auto_applied() {
+        let tips = [
+            tip(2, &[("a", Some(file(1)))]),
+            tip(3, &[("a/b", Some(file(2)))]),
+        ];
+        let plan = plan_sync(&BTreeMap::new(), &BTreeMap::new(), &tips).unwrap();
+        assert!(plan.apply_remote.is_empty());
+        assert!(plan.publish_local.is_empty());
+        assert_eq!(plan.conflicts.len(), 2);
+        assert_eq!(plan.conflicts[0].remote_candidates.len(), 2);
+        let incompatible = [
+            ConflictChoice {
+                path: path("a"),
+                selected: LocalOrRemote::Remote,
+                remote_commit_id: Some(Uuid::from_u128(2)),
+            },
+            ConflictChoice {
+                path: path("a/b"),
+                selected: LocalOrRemote::Remote,
+                remote_commit_id: Some(Uuid::from_u128(3)),
+            },
+        ];
+        assert!(plan.resolved_snapshot(&incompatible).is_err());
+    }
+
+    #[test]
+    fn tombstone_ancestor_does_not_block_a_live_descendant() {
+        let local = snapshot(&[("a", Some(SnapshotEntry::Tombstone))]);
+        let remote = tip(2, &[("a/b", Some(file(2)))]);
+        let plan = plan_sync(&BTreeMap::new(), &local, &[remote]).unwrap();
+        assert!(plan.conflicts.is_empty());
+        assert_eq!(plan.apply_remote, snapshot(&[("a/b", Some(file(2)))]));
     }
 }
