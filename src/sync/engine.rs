@@ -4,7 +4,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 use super::apply::{apply_staged_files, stage_remote_files};
-use super::merge::{plan_sync, resolve_remote_tips, SyncPlan};
+use super::merge::{plan_sync, resolve_remote_tips, Conflict, RemoteTip, RemoteVersion, SyncPlan};
 use super::model::{Commit, RelativePath, SnapshotEntry, SyncError, SyncState};
 use super::scan::scan_roots;
 use super::store::RemoteStore;
@@ -61,8 +61,18 @@ impl<S: RemoteStore> SyncEngine<S> {
             other => other?,
         };
         let tips = resolve_remote_tips(&commits)?;
-        validate_baseline_ancestry(state.last_applied_commit, &commits, &tips)?;
-        let plan = plan_sync(&state.baseline, &local, &tips)?;
+        validate_baseline_present(state.last_applied_commit, &commits)?;
+        // Include the saved commit as an ancestry anchor but compare sibling
+        // tips from their shared base so changes on both branches conflict.
+        let plan = match select_planning_base(
+            state.last_applied_commit,
+            &state.baseline,
+            &commits,
+            &tips,
+        )? {
+            PlanningBase::Snapshot(snapshot) => plan_sync(&snapshot, &local, &tips)?,
+            PlanningBase::Ambiguous => conservative_conflict_plan(&local, &tips)?,
+        };
         if !plan.conflicts.is_empty() {
             return Ok(SyncOutcome::Conflicts(plan));
         }
@@ -155,10 +165,11 @@ impl<S: RemoteStore> SyncEngine<S> {
     }
 }
 
-fn validate_baseline_ancestry(
+// Until account setup persists a repository identity, a foreign root cannot
+// be distinguished from a concurrent genesis root; only missing known IDs fail.
+fn validate_baseline_present(
     last_applied: Option<Uuid>,
     commits: &[Commit],
-    tips: &[super::merge::RemoteTip],
 ) -> Result<(), SyncError> {
     let Some(baseline_id) = last_applied else {
         return Ok(());
@@ -169,30 +180,110 @@ fn validate_baseline_ancestry(
             "last applied commit is missing from remote history: {baseline_id}"
         )));
     }
-    for tip in tips {
-        let mut pending = vec![tip.commit_id];
-        let mut visited = std::collections::BTreeSet::new();
-        let mut found = false;
+    Ok(())
+}
+
+enum PlanningBase {
+    Snapshot(BTreeMap<RelativePath, SnapshotEntry>),
+    Ambiguous,
+}
+
+fn select_planning_base(
+    last_applied: Option<Uuid>,
+    saved_baseline: &BTreeMap<RelativePath, SnapshotEntry>,
+    commits: &[Commit],
+    tips: &[RemoteTip],
+) -> Result<PlanningBase, SyncError> {
+    let by_id: BTreeMap<_, _> = commits.iter().map(|commit| (commit.id, commit)).collect();
+    // With no saved cloud revision, a single tip is a first download, not
+    // its own comparison base. For multiple tips, use their shared history
+    // when one exists; unrelated initial roots compare from an empty base.
+    if last_applied.is_none() && tips.len() < 2 {
+        return Ok(PlanningBase::Snapshot(BTreeMap::new()));
+    }
+    let mut anchors: Vec<_> = last_applied.into_iter().collect();
+    anchors.extend(tips.iter().map(|tip| tip.commit_id));
+    anchors.sort();
+    anchors.dedup();
+    if anchors.is_empty() {
+        return Ok(PlanningBase::Snapshot(BTreeMap::new()));
+    }
+
+    let mut common: Option<std::collections::BTreeSet<Uuid>> = None;
+    for anchor in anchors {
+        let mut ancestors = std::collections::BTreeSet::new();
+        let mut pending = vec![anchor];
         while let Some(id) = pending.pop() {
-            if !visited.insert(id) {
-                continue;
-            }
-            if id == baseline_id {
-                found = true;
-                break;
-            }
-            if let Some(commit) = by_id.get(&id) {
+            if ancestors.insert(id) {
+                let commit = by_id.get(&id).ok_or_else(|| {
+                    SyncError::Integrity(format!("missing commit in ancestry: {id}"))
+                })?;
                 pending.extend(commit.parents.iter().copied());
             }
         }
-        if !found {
-            return Err(SyncError::Integrity(format!(
-                "remote tip {} is not descended from last applied commit {baseline_id}",
-                tip.commit_id
-            )));
+        common = Some(match common {
+            None => ancestors,
+            Some(previous) => previous.intersection(&ancestors).copied().collect(),
+        });
+    }
+    let common = common.unwrap_or_default();
+    if common.is_empty() {
+        // No common ancestry is expected for clients that initialized while
+        // the remote store was empty. Compare from a virtual empty snapshot.
+        return Ok(PlanningBase::Snapshot(BTreeMap::new()));
+    }
+
+    let mut non_maximal = std::collections::BTreeSet::new();
+    for commit in commits {
+        if common.contains(&commit.id) {
+            non_maximal.extend(
+                commit
+                    .parents
+                    .iter()
+                    .filter(|parent| common.contains(parent))
+                    .copied(),
+            );
         }
     }
-    Ok(())
+    let maximal: Vec<_> = common.difference(&non_maximal).copied().collect();
+    if maximal.len() != 1 {
+        return Ok(PlanningBase::Ambiguous);
+    }
+    let base_id = maximal[0];
+    if Some(base_id) == last_applied {
+        return Ok(PlanningBase::Snapshot(saved_baseline.clone()));
+    }
+    let base = by_id
+        .get(&base_id)
+        .ok_or_else(|| SyncError::Integrity(format!("missing merge base: {base_id}")))?;
+    Ok(PlanningBase::Snapshot(base.entries.clone()))
+}
+
+fn conservative_conflict_plan(
+    local: &BTreeMap<RelativePath, SnapshotEntry>,
+    tips: &[RemoteTip],
+) -> Result<SyncPlan, SyncError> {
+    let mut plan = plan_sync(&BTreeMap::new(), local, tips)?;
+    let mut paths: std::collections::BTreeSet<_> = local.keys().cloned().collect();
+    paths.extend(tips.iter().flat_map(|tip| tip.snapshot.keys().cloned()));
+    plan.conflicts = paths
+        .into_iter()
+        .map(|path| Conflict {
+            local: local.get(&path).cloned(),
+            remote_candidates: plan
+                .remote_tips
+                .iter()
+                .map(|tip| RemoteVersion {
+                    commit_ids: vec![tip.commit_id],
+                    entry: tip.snapshot.get(&path).cloned(),
+                })
+                .collect(),
+            path,
+        })
+        .collect();
+    plan.apply_remote.clear();
+    plan.publish_local.clear();
+    Ok(plan)
 }
 
 fn state_dir(root: &Path, path: &Path, create: bool) -> Result<Option<Dir>, SyncError> {
@@ -708,38 +799,199 @@ mod tests {
     }
 
     #[test]
-    fn unrelated_remote_tip_is_rejected_without_fresh_root_or_baseline_advance() {
-        let tree = Tree::new();
-        tree.write("saved", b"baseline");
-        let mut engine = tree.engine(MemoryRemoteStore::default());
-        engine.synchronize().unwrap();
+    fn concurrent_sibling_tip_with_conflicting_edit_returns_both_candidates() {
+        let (tree, store, local_id, remote_id) =
+            sibling_branches("save", b"local edit", "save", b"remote edit");
         let saved_state = fs::read(tree.state()).unwrap();
-        let mut foreign_entries = BTreeMap::new();
-        foreign_entries.insert(
-            RelativePath::new("touchHLE_apps/foreign").unwrap(),
-            file_entry_for_test(b"foreign"),
-        );
-        let foreign_hash: [u8; 32] = Sha256::digest(b"foreign").into();
-        engine
-            .store()
-            .write_object(foreign_hash, b"foreign")
-            .unwrap();
-        engine
-            .store()
-            .write_commit(&Commit {
-                id: Uuid::from_u128(99),
-                device_id: Uuid::from_u128(98),
-                created_unix_ms: 0,
-                parents: vec![],
-                entries: foreign_entries,
-            })
-            .unwrap();
-        tree.write("pending", b"local change");
+        let mut engine = tree.engine(store);
 
-        assert!(matches!(engine.synchronize(), Err(SyncError::Integrity(_))));
-        assert_eq!(engine.store().list_commits().unwrap().len(), 2);
+        let SyncOutcome::Conflicts(plan) = engine.synchronize().unwrap() else {
+            panic!("sibling history must reach conflict resolution");
+        };
+        assert_eq!(plan.remote_tips.len(), 2);
+        assert!(plan.remote_tips.iter().any(|tip| tip.commit_id == local_id));
+        assert!(plan
+            .remote_tips
+            .iter()
+            .any(|tip| tip.commit_id == remote_id));
+        assert_eq!(plan.conflicts.len(), 1);
+        assert_eq!(plan.conflicts[0].remote_candidates.len(), 2);
+        assert!(matches!(
+            plan.resolved_snapshot(&[]),
+            Err(SyncError::UnresolvedConflicts(_))
+        ));
         assert_eq!(fs::read(tree.state()).unwrap(), saved_state);
-        assert_eq!(fs::read(tree.file("pending")).unwrap(), b"local change");
+        assert_eq!(fs::read(tree.file("save")).unwrap(), b"local edit");
+    }
+
+    #[test]
+    fn concurrent_sibling_disjoint_edits_merge_with_both_parents() {
+        let (tree, store, local_id, remote_id) =
+            sibling_branches("device", b"local edit", "cloud", b"remote edit");
+        let mut engine = tree.engine(store);
+
+        assert!(matches!(
+            engine.synchronize().unwrap(),
+            SyncOutcome::Published
+        ));
+        let commits = engine.store().list_commits().unwrap();
+        let tips = resolve_remote_tips(&commits).unwrap();
+        assert_eq!(tips.len(), 1);
+        let merge = commits
+            .iter()
+            .find(|commit| commit.id == tips[0].commit_id)
+            .unwrap();
+        let mut expected_parents = vec![local_id, remote_id];
+        expected_parents.sort();
+        assert_eq!(merge.parents, expected_parents);
+        assert_eq!(fs::read(tree.file("device")).unwrap(), b"local edit");
+        assert_eq!(fs::read(tree.file("cloud")).unwrap(), b"remote edit");
+    }
+
+    #[test]
+    fn concurrent_initial_roots_are_retained_as_conflict_candidates() {
+        let first = Tree::new();
+        let second = Tree::new();
+        first.write("save", b"first root");
+        second.write("save", b"second root");
+        let mut first_engine = first.engine(MemoryRemoteStore::default());
+        let mut second_engine = second.engine(MemoryRemoteStore::default());
+        first_engine.synchronize().unwrap();
+        second_engine.synchronize().unwrap();
+        let mut first_store = first_engine.into_store();
+        let mut second_store = second_engine.into_store();
+        let first_id = first_store.list_commits().unwrap()[0].id;
+        let second_commits = second_store.list_commits().unwrap();
+        let second_id = second_commits[0].id;
+
+        let mut combined = first_store;
+        for hash in second_store.object_hashes() {
+            let bytes = second_store.read_object(&hash).unwrap().unwrap();
+            combined.write_object(hash, &bytes).unwrap();
+        }
+        for commit in second_commits {
+            combined.write_commit(&commit).unwrap();
+        }
+        let saved_state = fs::read(first.state()).unwrap();
+        let mut engine = first.engine(combined);
+
+        let SyncOutcome::Conflicts(plan) = engine.synchronize().unwrap() else {
+            panic!("concurrent roots must reach conflict resolution");
+        };
+        assert_eq!(plan.remote_tips.len(), 2);
+        assert!(plan.remote_tips.iter().any(|tip| tip.commit_id == first_id));
+        assert!(plan
+            .remote_tips
+            .iter()
+            .any(|tip| tip.commit_id == second_id));
+        assert_eq!(plan.conflicts.len(), 1);
+        assert_eq!(plan.conflicts[0].remote_candidates.len(), 2);
+        assert!(matches!(
+            plan.resolved_snapshot(&[]),
+            Err(SyncError::UnresolvedConflicts(_))
+        ));
+        assert_eq!(engine.store().list_commits().unwrap().len(), 2);
+        assert_eq!(fs::read(first.state()).unwrap(), saved_state);
+        assert_eq!(fs::read(first.file("save")).unwrap(), b"first root");
+    }
+
+    #[test]
+    fn incomparable_merge_bases_require_conservative_choices() {
+        let tree = Tree::new();
+        let mut store = MemoryRemoteStore::default();
+        let root = Commit {
+            id: Uuid::from_u128(201),
+            device_id: Uuid::nil(),
+            created_unix_ms: 0,
+            parents: vec![],
+            entries: BTreeMap::new(),
+        };
+        let base_one = Commit {
+            id: Uuid::from_u128(202),
+            parents: vec![root.id],
+            ..root.clone()
+        };
+        let base_two = Commit {
+            id: Uuid::from_u128(203),
+            parents: vec![root.id],
+            ..root.clone()
+        };
+        for (id, path, content) in [
+            (204, "one", b"one".as_slice()),
+            (205, "two", b"two".as_slice()),
+        ] {
+            let hash: [u8; 32] = Sha256::digest(content).into();
+            store.write_object(hash, content).unwrap();
+            store
+                .write_commit(&Commit {
+                    id: Uuid::from_u128(id),
+                    parents: vec![base_one.id, base_two.id],
+                    entries: BTreeMap::from([(
+                        RelativePath::new(&format!("touchHLE_apps/{path}")).unwrap(),
+                        file_entry_for_test(content),
+                    )]),
+                    ..root.clone()
+                })
+                .unwrap();
+        }
+        store.write_commit(&root).unwrap();
+        store.write_commit(&base_one).unwrap();
+        store.write_commit(&base_two).unwrap();
+        let mut engine = tree.engine(store);
+
+        let SyncOutcome::Conflicts(plan) = engine.synchronize().unwrap() else {
+            panic!("incomparable merge bases must require conservative choices");
+        };
+        assert!(plan.conflicts.len() >= 2);
+        assert_eq!(plan.remote_tips.len(), 2);
+        assert!(!tree.state().exists());
+        assert!(!tree.file("one").exists());
+        assert!(!tree.file("two").exists());
+    }
+
+    fn sibling_branches(
+        local_path: &str,
+        local_bytes: &[u8],
+        remote_path: &str,
+        remote_bytes: &[u8],
+    ) -> (Tree, MemoryRemoteStore, Uuid, Uuid) {
+        let origin = Tree::new();
+        origin.write("base", b"common ancestor");
+        let mut seed = origin.engine(MemoryRemoteStore::default());
+        seed.synchronize().unwrap();
+        let shared = seed.into_store();
+
+        let local = Tree::new();
+        let mut local_engine = local.engine(shared.clone());
+        local_engine.synchronize().unwrap();
+        local.write(local_path, local_bytes);
+        local_engine.synchronize().unwrap();
+        let mut local_store = local_engine.into_store();
+        let local_id =
+            resolve_remote_tips(&local_store.list_commits().unwrap()).unwrap()[0].commit_id;
+
+        let remote = Tree::new();
+        let mut remote_engine = remote.engine(shared);
+        remote_engine.synchronize().unwrap();
+        remote.write(remote_path, remote_bytes);
+        remote_engine.synchronize().unwrap();
+        let mut combined = remote_engine.into_store();
+        for hash in local_store.object_hashes() {
+            if combined.read_object(&hash).unwrap().is_none() {
+                let bytes = local_store.read_object(&hash).unwrap().unwrap();
+                combined.write_object(hash, &bytes).unwrap();
+            }
+        }
+        for commit in local_store.list_commits().unwrap() {
+            combined.write_commit(&commit).unwrap();
+        }
+        let remote_id = resolve_remote_tips(&combined.list_commits().unwrap())
+            .unwrap()
+            .into_iter()
+            .find(|tip| tip.commit_id != local_id)
+            .unwrap()
+            .commit_id;
+        (local, combined, local_id, remote_id)
     }
 
     #[test]
