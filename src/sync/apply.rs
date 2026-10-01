@@ -3,9 +3,10 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
-use super::model::{RelativePath, SnapshotEntry, SyncError};
+use super::merge::{ConflictChoice, SyncPlan};
+use super::model::{LocalOrRemote, RelativePath, SnapshotEntry, SyncError};
 use crate::paths::SYNC_DIR;
-use cap_fs_ext::DirExt;
+use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
 use cap_std::ambient_authority;
 use cap_std::fs::{Dir, DirBuilder, OpenOptions};
 use sha2::{Digest, Sha256};
@@ -29,9 +30,32 @@ enum StagedOperation {
     Tombstone,
 }
 
-/// `entries` must be selected from a whole snapshot validated by
-/// `SyncPlan::resolved_snapshot`; never pass unresolved plan action maps.
+/// Resolves every conflict before reading any remote object or staging an action.
+/// Only automatic remote actions and explicitly chosen remote versions are applied.
 pub fn stage_remote_files(
+    root: &Path,
+    plan: &SyncPlan,
+    choices: &[ConflictChoice],
+    read_object: impl FnMut(&[u8; 32]) -> Result<Vec<u8>, SyncError>,
+) -> Result<Vec<StagedFile>, SyncError> {
+    let resolved = plan.resolved_snapshot(choices)?;
+    let mut entries = BTreeMap::new();
+    for (path, entry) in &plan.apply_remote {
+        if resolved.contains_key(path) {
+            entries.insert(path.clone(), entry.clone());
+        }
+    }
+    for choice in choices {
+        if choice.selected == LocalOrRemote::Remote {
+            if let Some(entry) = resolved.get(&choice.path) {
+                entries.insert(choice.path.clone(), entry.clone());
+            }
+        }
+    }
+    stage_selected_files(root, &entries, read_object)
+}
+
+fn stage_selected_files(
     root: &Path,
     entries: &BTreeMap<RelativePath, SnapshotEntry>,
     mut read_object: impl FnMut(&[u8; 32]) -> Result<Vec<u8>, SyncError>,
@@ -88,17 +112,45 @@ pub fn stage_remote_files(
         Ok(staged)
     })();
     if result.is_err() {
-        sync_dir.remove_dir_all(&name)?;
+        let _ = sync_dir.remove_dir_all(&name);
     }
     result
 }
 
-/// Each rename is atomic; a multi-file apply is not an atomic transaction.
-/// The caller must save the new baseline only after the complete apply succeeds.
+/// Each rename is atomic; multi-file apply can fail after earlier paths changed.
+/// The caller must prevent concurrent writes (including guest writes) until apply
+/// finishes and save the baseline only after the complete apply succeeds.
 pub fn apply_staged_files(root: &Path, staged: Vec<StagedFile>) -> Result<(), SyncError> {
+    apply_staged_files_with_hook(root, staged, || {})
+}
+
+fn apply_staged_files_with_hook(
+    root: &Path,
+    staged: Vec<StagedFile>,
+    after_backup: impl FnOnce(),
+) -> Result<(), SyncError> {
+    let result = apply_verified(root, &staged, after_backup);
+    // Staging is scratch space. Cleanup must never turn a successful apply
+    // into a reported failure after live files were already changed.
+    cleanup_staging(root, &staged);
+    result
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum TargetState {
+    Missing,
+    Directory,
+    File([u8; 32]),
+}
+
+fn apply_verified(
+    root: &Path,
+    staged: &[StagedFile],
+    after_backup: impl FnOnce(),
+) -> Result<(), SyncError> {
     let root_dir = Dir::open_ambient_dir(root, ambient_authority())?;
     let mut selected = BTreeMap::new();
-    for item in &staged {
+    for item in staged {
         if item.destination != root.join(item.path.as_str()) {
             return Err(SyncError::InvalidPath(item.path.as_str().to_owned()));
         }
@@ -121,7 +173,7 @@ pub fn apply_staged_files(root: &Path, staged: Vec<StagedFile>) -> Result<(), Sy
     // Verify every staged object before changing any live file.
     let sync_dir = open_sync_dir(&root_dir)?;
     let mut verified = Vec::with_capacity(staged.len());
-    for item in &staged {
+    for item in staged {
         let bytes = match &item.operation {
             StagedOperation::File {
                 temporary_path,
@@ -142,72 +194,133 @@ pub fn apply_staged_files(root: &Path, staged: Vec<StagedFile>) -> Result<(), Sy
     }
 
     // Keep every reachable displaced blob before any replacement or deletion.
-    for item in &staged {
-        let Some((parent, name)) = open_parent(&root_dir, &item.path, false)? else {
-            continue;
-        };
-        match parent.symlink_metadata(name) {
-            Ok(metadata) if metadata.is_file() => {
-                let bytes = read_regular(&parent, name)?;
-                let hash: [u8; 32] = Sha256::digest(&bytes).into();
-                preserve_local_version(root, &item.path, &hash)?;
-            }
-            Ok(metadata) if metadata.is_dir() => {}
-            Ok(_) => return Err(SyncError::InvalidPath(item.path.as_str().to_owned())),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e.into()),
+    let mut initial = Vec::with_capacity(staged.len());
+    for item in staged {
+        let (state, bytes) = target_contents(&root_dir, &item.path)?;
+        if let (TargetState::File(hash), Some(bytes)) = (state, bytes) {
+            preserve_bytes(&root_dir, &bytes, &hash)?;
         }
+        initial.push(state);
     }
+    after_backup();
 
     // Remove selected tombstones before creating descendants of old files.
-    for item in &staged {
+    for (item, expected) in staged.iter().zip(&initial) {
         if !matches!(item.operation, StagedOperation::Tombstone) {
             continue;
         }
+        let current = check_target(&root_dir, &item.path, *expected)?;
+        if !matches!(current, TargetState::File(_)) {
+            continue;
+        }
         if let Some((parent, name)) = open_parent(&root_dir, &item.path, false)? {
-            match parent.symlink_metadata(name) {
-                Ok(metadata) if metadata.is_file() => parent.remove_file(name)?,
-                Ok(metadata) if metadata.is_dir() => {}
-                Ok(_) => return Err(SyncError::InvalidPath(item.path.as_str().to_owned())),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e.into()),
-            }
+            parent.remove_file(name)?;
         }
     }
 
-    for (item, bytes) in staged.iter().zip(&verified) {
+    for ((item, bytes), expected) in staged.iter().zip(&verified).zip(&initial) {
         if let Some(bytes) = bytes {
-            let (parent, name) = open_parent(&root_dir, &item.path, true)?.unwrap();
-            match parent.symlink_metadata(name) {
-                Ok(metadata) if metadata.is_dir() => parent.remove_dir(name)?,
-                Ok(metadata) if metadata.is_file() => {}
-                Ok(_) => return Err(SyncError::InvalidPath(item.path.as_str().to_owned())),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e.into()),
+            if *expected == TargetState::Directory {
+                check_target(&root_dir, &item.path, TargetState::Directory)?;
+                let (parent, name) = open_parent(&root_dir, &item.path, false)?.unwrap();
+                parent.remove_dir(name)?;
             }
+            let (parent, name) = open_parent(&root_dir, &item.path, true)?.unwrap();
             let temporary = format!(".touchHLE-sync-{}", Uuid::new_v4());
-            let mut file =
-                parent.open_with(&temporary, OpenOptions::new().write(true).create_new(true))?;
-            file.write_all(bytes)?;
-            file.sync_all()?;
-            let result = parent.rename(&temporary, &parent, name);
-            if result.is_err() {
+            let mut created = false;
+            let result = (|| {
+                let mut file = parent
+                    .open_with(&temporary, OpenOptions::new().write(true).create_new(true))?;
+                created = true;
+                file.write_all(bytes)?;
+                file.sync_all()?;
+                drop(file);
+                let expected = if *expected == TargetState::Directory {
+                    TargetState::Missing
+                } else {
+                    *expected
+                };
+                check_target(&root_dir, &item.path, expected)?;
+                parent.rename(&temporary, &parent, name)?;
+                Ok::<_, SyncError>(())
+            })();
+            if created {
                 let _ = parent.remove_file(&temporary);
             }
             result?;
         }
     }
+    Ok(())
+}
 
-    for item in &staged {
+fn cleanup_staging(root: &Path, staged: &[StagedFile]) {
+    let Ok(root_dir) = Dir::open_ambient_dir(root, ambient_authority()) else {
+        return;
+    };
+    let Ok(sync_dir) = root_dir.open_dir_nofollow(SYNC_DIR) else {
+        return;
+    };
+    for item in staged {
         if let StagedOperation::File { temporary_path, .. } = &item.operation {
-            let relative = temporary_path.strip_prefix(root.join(SYNC_DIR)).unwrap();
-            let (stage_name, file_name) = staging_parts(relative)?;
-            let stage_dir = sync_dir.open_dir_nofollow(stage_name)?;
-            stage_dir.remove_file(file_name)?;
-            let _ = sync_dir.remove_dir(stage_name);
+            if let Ok(relative) = temporary_path.strip_prefix(root.join(SYNC_DIR)) {
+                if let Ok((stage_name, file_name)) = staging_parts(relative) {
+                    if let Ok(stage_dir) = sync_dir.open_dir_nofollow(stage_name) {
+                        let _ = stage_dir.remove_file(file_name);
+                        let _ = sync_dir.remove_dir(stage_name);
+                    }
+                }
+            }
         }
     }
-    Ok(())
+}
+
+fn target_contents(
+    root: &Dir,
+    path: &RelativePath,
+) -> Result<(TargetState, Option<Vec<u8>>), SyncError> {
+    target_contents_with_hook(root, path, || {})
+}
+
+fn target_contents_with_hook(
+    root: &Dir,
+    path: &RelativePath,
+    before_leaf_open: impl FnOnce(),
+) -> Result<(TargetState, Option<Vec<u8>>), SyncError> {
+    let Some((parent, name)) = open_parent(root, path, false)? else {
+        return Ok((TargetState::Missing, None));
+    };
+    match parent.symlink_metadata(name) {
+        Ok(metadata) if metadata.is_file() => {
+            before_leaf_open();
+            let bytes = read_regular(&parent, name)?;
+            Ok((
+                TargetState::File(Sha256::digest(&bytes).into()),
+                Some(bytes),
+            ))
+        }
+        Ok(metadata) if metadata.is_dir() => Ok((TargetState::Directory, None)),
+        Ok(_) => Err(SyncError::InvalidPath(path.as_str().to_owned())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok((TargetState::Missing, None)),
+        Err(e) => Err(e.into()),
+    }
+}
+
+fn check_target(
+    root: &Dir,
+    path: &RelativePath,
+    expected: TargetState,
+) -> Result<TargetState, SyncError> {
+    let (current, bytes) = target_contents(root, path)?;
+    if current != expected {
+        if let (TargetState::File(hash), Some(bytes)) = (current, bytes) {
+            preserve_bytes(root, &bytes, &hash)?;
+        }
+        return Err(SyncError::Integrity(format!(
+            "local file changed during apply: {}",
+            path.as_str()
+        )));
+    }
+    Ok(current)
 }
 
 pub fn preserve_local_version(
@@ -220,26 +333,59 @@ pub fn preserve_local_version(
         .ok_or_else(|| SyncError::InvalidPath(path.as_str().to_owned()))?;
     let bytes = read_regular(&parent, name)?;
     verify_hash(&bytes, content_hash)?;
-    let sync_dir = open_sync_dir(&root_dir)?;
+    preserve_bytes(&root_dir, &bytes, content_hash)
+}
+
+fn preserve_bytes(root: &Dir, bytes: &[u8], content_hash: &[u8; 32]) -> Result<(), SyncError> {
+    verify_hash(bytes, content_hash)?;
+    let sync_dir = open_sync_dir(root)?;
     let recovery = open_private_dir(&sync_dir, "recovery")?;
     let filename = hex_hash(content_hash);
-    if let Ok(existing) = read_regular(&recovery, &filename) {
-        return verify_hash(&existing, content_hash);
+    match recovery.symlink_metadata(&filename) {
+        Ok(_) => return verify_recovery(&recovery, &filename, content_hash),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
     }
     let temp = format!(".recovery-{}", Uuid::new_v4());
-    let mut file = recovery.open_with(&temp, OpenOptions::new().write(true).create_new(true))?;
-    file.write_all(&bytes)?;
-    file.sync_all()?;
-    // A hard link never replaces an existing recovery version.
-    let result = recovery.hard_link(&temp, &recovery, &filename);
-    recovery.remove_file(&temp)?;
-    match result {
+    let mut created = false;
+    let result = (|| {
+        let mut file =
+            recovery.open_with(&temp, OpenOptions::new().write(true).create_new(true))?;
+        created = true;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        make_readonly(&file)?;
+        file.sync_all()?;
+        drop(file);
+        // A hard link never replaces an existing recovery version.
+        Ok::<_, SyncError>(recovery.hard_link(&temp, &recovery, &filename))
+    })();
+    if created {
+        let _ = recovery.remove_file(&temp);
+    }
+    match result? {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            verify_hash(&read_regular(&recovery, &filename)?, content_hash)
+            verify_recovery(&recovery, &filename, content_hash)
         }
         Err(e) => Err(e.into()),
     }
+}
+
+fn verify_recovery(recovery: &Dir, name: &str, hash: &[u8; 32]) -> Result<(), SyncError> {
+    let mut file = open_regular(recovery, name)?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    verify_hash(&bytes, hash)?;
+    make_readonly(&file)?;
+    Ok(())
+}
+
+fn make_readonly(file: &cap_std::fs::File) -> Result<(), SyncError> {
+    let mut permissions = file.metadata()?.permissions();
+    permissions.set_readonly(true);
+    file.set_permissions(permissions)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -370,8 +516,16 @@ fn open_parent<'a>(
 }
 
 fn read_regular(parent: &Dir, name: impl AsRef<Path>) -> Result<Vec<u8>, SyncError> {
+    let mut file = open_regular(parent, name)?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+fn open_regular(parent: &Dir, name: impl AsRef<Path>) -> Result<cap_std::fs::File, SyncError> {
     let mut options = OpenOptions::new();
     options.read(true);
+    options.follow(FollowSymlinks::No);
     #[cfg(unix)]
     {
         use cap_fs_ext::OpenOptionsExt;
@@ -382,22 +536,37 @@ fn read_regular(parent: &Dir, name: impl AsRef<Path>) -> Result<Vec<u8>, SyncErr
         use cap_fs_ext::OpenOptionsExt;
         options.custom_flags(0x0020_0000);
     }
-    let mut file = parent.open_with(name, &options)?;
+    let file = parent.open_with(name, &options)?;
     if !file.metadata()?.is_file() {
         return Err(SyncError::Integrity("expected regular file".to_owned()));
     }
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)?;
-    Ok(bytes)
+    Ok(file)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sync::merge::{plan_sync, ConflictChoice, RemoteTip, SyncPlan};
     use crate::sync::model::{RelativePath, SnapshotEntry, SyncError};
     use sha2::{Digest, Sha256};
     use std::{collections::BTreeMap, fs, path::PathBuf};
     use uuid::Uuid;
+
+    fn stage_remote_files(
+        root: &Path,
+        entries: &BTreeMap<RelativePath, SnapshotEntry>,
+        reader: impl FnMut(&[u8; 32]) -> Result<Vec<u8>, SyncError>,
+    ) -> Result<Vec<StagedFile>, SyncError> {
+        let plan = SyncPlan {
+            apply_remote: entries.clone(),
+            publish_local: BTreeMap::new(),
+            conflicts: Vec::new(),
+            merge_parents: Vec::new(),
+            local_snapshot: BTreeMap::new(),
+            remote_tips: Vec::new(),
+        };
+        super::stage_remote_files(root, &plan, &[], reader)
+    }
 
     struct TestTree(PathBuf);
 
@@ -554,11 +723,13 @@ mod tests {
         let StagedOperation::File { temporary_path, .. } = &staged[0].operation else {
             panic!("expected staged file");
         };
-        fs::write(temporary_path, b"tampered").unwrap();
+        let temporary_path = temporary_path.clone();
+        fs::write(&temporary_path, b"tampered").unwrap();
         assert!(matches!(
             apply_staged_files(&tree.0, staged),
             Err(SyncError::Integrity(_))
         ));
+        assert!(!temporary_path.exists());
         assert_eq!(fs::read(tree.file("save")).unwrap(), b"local");
     }
 
@@ -650,5 +821,298 @@ mod tests {
             Err(SyncError::Integrity(_))
         ));
         assert_eq!(fs::read(tree.file("save")).unwrap(), b"local");
+    }
+
+    #[test]
+    fn missing_and_incompatible_choices_fail_before_any_download_or_write() {
+        let tree = TestTree::new();
+        fs::write(tree.file("parent"), b"local").unwrap();
+        let baseline = BTreeMap::new();
+        let local = entries("touchHLE_apps/parent", file_entry(b"local"));
+        let remote = RemoteTip {
+            commit_id: Uuid::new_v4(),
+            snapshot: entries("touchHLE_apps/parent/child", file_entry(b"remote")),
+        };
+        let plan = plan_sync(&baseline, &local, &[remote.clone()]).unwrap();
+        assert_eq!(plan.conflicts.len(), 2);
+        let mut reads = 0;
+        let mut reader = |_: &[u8; 32]| {
+            reads += 1;
+            Ok(b"remote".to_vec())
+        };
+        assert!(matches!(
+            super::stage_remote_files(&tree.0, &plan, &[], &mut reader),
+            Err(SyncError::UnresolvedConflicts(_))
+        ));
+        let choices = plan
+            .conflicts
+            .iter()
+            .map(|conflict| ConflictChoice {
+                path: conflict.path.clone(),
+                selected: if conflict.path.as_str() == "touchHLE_apps/parent" {
+                    super::super::model::LocalOrRemote::Local
+                } else {
+                    super::super::model::LocalOrRemote::Remote
+                },
+                remote_commit_id: (conflict.path.as_str() != "touchHLE_apps/parent")
+                    .then_some(remote.commit_id),
+            })
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            super::stage_remote_files(&tree.0, &plan, &choices, &mut reader),
+            Err(SyncError::UnresolvedConflicts(_))
+        ));
+        assert_eq!(reads, 0);
+        assert_eq!(fs::read(tree.file("parent")).unwrap(), b"local");
+    }
+
+    #[test]
+    fn stages_automatic_remote_and_explicit_remote_choice_only() {
+        let tree = TestTree::new();
+        let auto = RelativePath::new("touchHLE_apps/auto").unwrap();
+        let chosen = RelativePath::new("touchHLE_apps/chosen").unwrap();
+        let retained = RelativePath::new("touchHLE_apps/local").unwrap();
+        let baseline = BTreeMap::from([
+            (chosen.clone(), file_entry(b"base")),
+            (retained.clone(), file_entry(b"base")),
+        ]);
+        let local = BTreeMap::from([
+            (chosen.clone(), file_entry(b"local")),
+            (retained.clone(), file_entry(b"local")),
+        ]);
+        let tip = RemoteTip {
+            commit_id: Uuid::new_v4(),
+            snapshot: BTreeMap::from([
+                (auto.clone(), file_entry(b"auto")),
+                (chosen.clone(), file_entry(b"remote")),
+                (retained.clone(), file_entry(b"remote")),
+            ]),
+        };
+        let plan = plan_sync(&baseline, &local, &[tip.clone()]).unwrap();
+        assert_eq!(plan.conflicts.len(), 2);
+        let choices = vec![
+            ConflictChoice {
+                path: chosen.clone(),
+                selected: LocalOrRemote::Remote,
+                remote_commit_id: Some(tip.commit_id),
+            },
+            ConflictChoice {
+                path: retained.clone(),
+                selected: LocalOrRemote::Local,
+                remote_commit_id: None,
+            },
+        ];
+        let mut reads = Vec::new();
+        let auto_hash: [u8; 32] = Sha256::digest(b"auto").into();
+        let staged = super::stage_remote_files(&tree.0, &plan, &choices, |hash| {
+            reads.push(*hash);
+            if *hash == auto_hash {
+                Ok(b"auto".to_vec())
+            } else {
+                Ok(b"remote".to_vec())
+            }
+        })
+        .unwrap();
+        assert_eq!(staged.len(), 2);
+        assert!(staged.iter().any(|file| file.path == auto));
+        assert!(staged.iter().any(|file| file.path == chosen));
+        assert!(!staged.iter().any(|file| file.path == retained));
+        assert_eq!(reads.len(), 2);
+    }
+
+    #[test]
+    fn final_tombstone_check_preserves_intervening_bytes_and_baseline() {
+        let tree = TestTree::new();
+        fs::write(tree.file("save"), b"initial").unwrap();
+        let baseline = tree.0.join(".touchHLE_sync/state.json");
+        fs::create_dir(baseline.parent().unwrap()).unwrap();
+        fs::write(&baseline, b"old baseline").unwrap();
+        let staged = stage_remote_files(
+            &tree.0,
+            &entries("touchHLE_apps/save", SnapshotEntry::Tombstone),
+            |_| panic!("tombstone must not download"),
+        )
+        .unwrap();
+        assert!(matches!(
+            apply_staged_files_with_hook(&tree.0, staged, || {
+                fs::write(tree.file("save"), b"intervening").unwrap();
+            }),
+            Err(SyncError::Integrity(_))
+        ));
+        assert_eq!(fs::read(tree.file("save")).unwrap(), b"intervening");
+        let hash: [u8; 32] = Sha256::digest(b"intervening").into();
+        assert_eq!(
+            fs::read(recovery_path(&tree.0, &hash)).unwrap(),
+            b"intervening"
+        );
+        assert_eq!(fs::read(baseline).unwrap(), b"old baseline");
+    }
+
+    #[test]
+    fn final_rename_check_preserves_intervening_bytes_and_baseline() {
+        let tree = TestTree::new();
+        fs::write(tree.file("save"), b"initial").unwrap();
+        let baseline = tree.0.join(".touchHLE_sync/state.json");
+        fs::create_dir(baseline.parent().unwrap()).unwrap();
+        fs::write(&baseline, b"old baseline").unwrap();
+        let staged = stage_remote_files(
+            &tree.0,
+            &entries("touchHLE_apps/save", file_entry(b"remote")),
+            |_| Ok(b"remote".to_vec()),
+        )
+        .unwrap();
+        assert!(matches!(
+            apply_staged_files_with_hook(&tree.0, staged, || {
+                fs::write(tree.file("save"), b"intervening").unwrap();
+            }),
+            Err(SyncError::Integrity(_))
+        ));
+        assert_eq!(fs::read(tree.file("save")).unwrap(), b"intervening");
+        let hash: [u8; 32] = Sha256::digest(b"intervening").into();
+        assert_eq!(
+            fs::read(recovery_path(&tree.0, &hash)).unwrap(),
+            b"intervening"
+        );
+        assert_eq!(fs::read(baseline).unwrap(), b"old baseline");
+    }
+
+    #[test]
+    fn partial_multifile_apply_keeps_changed_later_bytes_recoverable() {
+        let tree = TestTree::new();
+        fs::write(tree.file("a"), b"old a").unwrap();
+        fs::write(tree.file("b"), b"old b").unwrap();
+        let baseline = tree.0.join(".touchHLE_sync/state.json");
+        fs::create_dir(baseline.parent().unwrap()).unwrap();
+        fs::write(&baseline, b"old baseline").unwrap();
+        let selected = BTreeMap::from([
+            (
+                RelativePath::new("touchHLE_apps/a").unwrap(),
+                file_entry(b"new a"),
+            ),
+            (
+                RelativePath::new("touchHLE_apps/b").unwrap(),
+                file_entry(b"new b"),
+            ),
+        ]);
+        let first_hash: [u8; 32] = Sha256::digest(b"new a").into();
+        let staged = stage_remote_files(&tree.0, &selected, |hash| {
+            if *hash == first_hash {
+                Ok(b"new a".to_vec())
+            } else {
+                Ok(b"new b".to_vec())
+            }
+        })
+        .unwrap();
+        assert!(matches!(
+            apply_staged_files_with_hook(&tree.0, staged, || {
+                fs::write(tree.file("b"), b"intervening b").unwrap();
+            }),
+            Err(SyncError::Integrity(_))
+        ));
+        assert_eq!(fs::read(tree.file("a")).unwrap(), b"new a");
+        assert_eq!(fs::read(tree.file("b")).unwrap(), b"intervening b");
+        let hash: [u8; 32] = Sha256::digest(b"intervening b").into();
+        assert_eq!(
+            fs::read(recovery_path(&tree.0, &hash)).unwrap(),
+            b"intervening b"
+        );
+        assert_eq!(fs::read(baseline).unwrap(), b"old baseline");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_scratch_cleanup_after_apply_does_not_report_failed_live_update() {
+        use std::os::unix::fs::symlink;
+
+        let tree = TestTree::new();
+        fs::write(tree.file("save"), b"local").unwrap();
+        let staged = stage_remote_files(
+            &tree.0,
+            &entries("touchHLE_apps/save", file_entry(b"remote")),
+            |_| Ok(b"remote".to_vec()),
+        )
+        .unwrap();
+        let StagedOperation::File { temporary_path, .. } = &staged[0].operation else {
+            panic!("expected staged file");
+        };
+        let staging_dir = temporary_path.parent().unwrap().to_path_buf();
+        let parked = tree.0.join("parked-staging");
+        apply_staged_files_with_hook(&tree.0, staged, || {
+            fs::rename(&staging_dir, &parked).unwrap();
+            symlink(&parked, &staging_dir).unwrap();
+        })
+        .unwrap();
+        assert_eq!(fs::read(tree.file("save")).unwrap(), b"remote");
+    }
+
+    #[test]
+    fn recovery_copy_is_read_only_and_reused_with_verified_hash() {
+        let tree = TestTree::new();
+        fs::write(tree.file("save"), b"local").unwrap();
+        let hash: [u8; 32] = Sha256::digest(b"local").into();
+        preserve_local_version(
+            &tree.0,
+            &RelativePath::new("touchHLE_apps/save").unwrap(),
+            &hash,
+        )
+        .unwrap();
+        preserve_local_version(
+            &tree.0,
+            &RelativePath::new("touchHLE_apps/save").unwrap(),
+            &hash,
+        )
+        .unwrap();
+        let recovery = recovery_path(&tree.0, &hash);
+        assert!(fs::metadata(&recovery).unwrap().permissions().readonly());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(recovery).unwrap().permissions().mode() & 0o222,
+                0
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_leaf_is_not_read_or_backed_up() {
+        use std::os::unix::fs::symlink;
+        let tree = TestTree::new();
+        let outside = tree.0.join("outside");
+        fs::write(&outside, b"outside").unwrap();
+        symlink(&outside, tree.file("save")).unwrap();
+        let staged = stage_remote_files(
+            &tree.0,
+            &entries("touchHLE_apps/save", SnapshotEntry::Tombstone),
+            |_| panic!("tombstones do not download"),
+        )
+        .unwrap();
+        assert!(apply_staged_files(&tree.0, staged).is_err());
+        assert_eq!(fs::read(outside).unwrap(), b"outside");
+        assert!(!recovery_path(&tree.0, &Sha256::digest(b"outside").into()).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn leaf_swapped_to_symlink_after_metadata_is_not_followed() {
+        use std::os::unix::fs::symlink;
+
+        let tree = TestTree::new();
+        fs::write(tree.file("save"), b"initial").unwrap();
+        let outside = tree.0.join("outside");
+        fs::write(&outside, b"outside").unwrap();
+        let root = Dir::open_ambient_dir(&tree.0, ambient_authority()).unwrap();
+        let result = target_contents_with_hook(
+            &root,
+            &RelativePath::new("touchHLE_apps/save").unwrap(),
+            || {
+                fs::rename(tree.file("save"), tree.file("parked")).unwrap();
+                symlink(&outside, tree.file("save")).unwrap();
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(fs::read(&outside).unwrap(), b"outside");
+        assert!(!recovery_path(&tree.0, &Sha256::digest(b"outside").into()).exists());
     }
 }
