@@ -7,5 +7,6 @@ pub mod apply;
 pub mod engine;
 pub mod merge;
 pub mod model;
+pub mod reconcile;
 pub mod scan;
 pub mod store;

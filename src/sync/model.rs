@@ -3,6 +3,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
+use super::reconcile::FileBaseline;
 use crate::paths::{APPS_DIR, SANDBOX_DIR};
 use serde::{
     de::{Error as _, MapAccess, Visitor},
@@ -100,6 +101,167 @@ pub struct SyncState {
     pub baseline: BTreeMap<RelativePath, SnapshotEntry>,
 }
 
+pub type LegacySyncState = SyncState;
+
+pub const CURRENT_SCHEMA_VERSION: u32 = 2;
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CurrentSyncState {
+    pub schema_version: u32,
+    pub device_id: Uuid,
+    pub account_id: Option<String>,
+    pub root_folder_id: Option<String>,
+    pub changes_cursor: Option<String>,
+    #[serde(deserialize_with = "deserialize_baseline")]
+    pub baseline: BTreeMap<RelativePath, FileBaseline>,
+    pub file_paths_by_id: BTreeMap<String, RelativePath>,
+    pub folder_paths_by_id: BTreeMap<String, String>,
+}
+
+impl CurrentSyncState {
+    pub fn new(device_id: Uuid) -> Self {
+        Self {
+            schema_version: CURRENT_SCHEMA_VERSION,
+            device_id,
+            account_id: None,
+            root_folder_id: None,
+            changes_cursor: None,
+            baseline: BTreeMap::new(),
+            file_paths_by_id: BTreeMap::new(),
+            folder_paths_by_id: BTreeMap::new(),
+        }
+    }
+
+    // A deleted path is useful only while this installation still has local
+    // bytes to compare against the last observed value.
+    pub fn prune_deleted_paths(
+        &mut self,
+        local: &BTreeMap<RelativePath, SnapshotEntry>,
+        remote: &BTreeMap<RelativePath, super::reconcile::RemoteFile>,
+    ) {
+        self.baseline
+            .retain(|path, _| local.contains_key(path) || remote.contains_key(path));
+        self.file_paths_by_id.retain(|id, path| {
+            self.baseline
+                .get(path)
+                .is_some_and(|baseline| baseline.remote_id.as_deref() == Some(id.as_str()))
+        });
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LoadedSyncState {
+    Current(CurrentSyncState),
+    Legacy(LegacySyncState),
+    Missing,
+}
+
+pub fn load_sync_state(bytes: Option<&[u8]>) -> Result<LoadedSyncState, SyncError> {
+    let Some(bytes) = bytes else {
+        return Ok(LoadedSyncState::Missing);
+    };
+    let value: serde_json::Value = serde_json::from_slice(bytes)
+        .map_err(|error| SyncError::Integrity(format!("invalid sync checkpoint: {error}")))?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| SyncError::Integrity("sync checkpoint must be a JSON object".into()))?;
+    if object.contains_key("schema_version") {
+        let state: CurrentSyncState = serde_json::from_slice(bytes).map_err(|error| {
+            SyncError::Integrity(format!("invalid current checkpoint: {error}"))
+        })?;
+        if state.schema_version != CURRENT_SCHEMA_VERSION {
+            return Err(SyncError::Integrity(
+                "unsupported sync checkpoint version".into(),
+            ));
+        }
+        return Ok(LoadedSyncState::Current(state));
+    }
+    if !object.contains_key("device_id")
+        || !object.contains_key("last_applied_commit")
+        || !object.contains_key("baseline")
+    {
+        return Err(SyncError::Integrity(
+            "incomplete legacy sync checkpoint".into(),
+        ));
+    }
+    let state = serde_json::from_slice(bytes)
+        .map_err(|error| SyncError::Integrity(format!("invalid legacy checkpoint: {error}")))?;
+    Ok(LoadedSyncState::Legacy(state))
+}
+
+fn deserialize_baseline<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<BTreeMap<RelativePath, FileBaseline>, D::Error> {
+    struct BaselineVisitor;
+    impl<'de> Visitor<'de> for BaselineVisitor {
+        type Value = BTreeMap<RelativePath, FileBaseline>;
+
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("a baseline with distinct paths")
+        }
+
+        fn visit_map<M: MapAccess<'de>>(self, mut map: M) -> Result<Self::Value, M::Error> {
+            let mut entries = BTreeMap::new();
+            while let Some((path, baseline)) = map.next_entry()? {
+                if entries.insert(path, baseline).is_some() {
+                    return Err(M::Error::custom("duplicate baseline path"));
+                }
+            }
+            let paths = entries
+                .keys()
+                .cloned()
+                .map(|path| (path, SnapshotEntry::Tombstone))
+                .collect();
+            validate_entries(&paths).map_err(M::Error::custom)?;
+            Ok(entries)
+        }
+    }
+    deserializer.deserialize_map(BaselineVisitor)
+}
+
+pub(crate) fn validate_entries(
+    entries: &BTreeMap<RelativePath, SnapshotEntry>,
+) -> Result<(), String> {
+    let mut seen = BTreeMap::<String, String>::new();
+    for key in entries.keys() {
+        let mut prefix = String::new();
+        for part in key.as_str().split('/') {
+            if !prefix.is_empty() {
+                prefix.push('/');
+            }
+            prefix.push_str(part);
+            let folded = prefix.as_str().case_fold().collect::<String>();
+            if let Some(previous) = seen.insert(folded, prefix.clone()) {
+                if previous != prefix {
+                    return Err(format!(
+                        "case-insensitive collision: {previous} and {prefix}"
+                    ));
+                }
+            }
+        }
+    }
+    for (key, entry) in entries {
+        if !matches!(entry, SnapshotEntry::File { .. }) {
+            continue;
+        }
+        let mut prefix = key.as_str();
+        while let Some((parent, _)) = prefix.rsplit_once('/') {
+            if matches!(
+                entries.get(&RelativePath(parent.to_owned())),
+                Some(SnapshotEntry::File { .. })
+            ) {
+                return Err(format!(
+                    "live file is an ancestor of another live file: {parent} and {}",
+                    key.as_str()
+                ));
+            }
+            prefix = parent;
+        }
+    }
+    Ok(())
+}
+
 fn deserialize_entries<'de, D: Deserializer<'de>>(
     deserializer: D,
 ) -> Result<BTreeMap<RelativePath, SnapshotEntry>, D::Error> {
@@ -114,45 +276,12 @@ fn deserialize_entries<'de, D: Deserializer<'de>>(
 
         fn visit_map<M: MapAccess<'de>>(self, mut map: M) -> Result<Self::Value, M::Error> {
             let mut entries = BTreeMap::new();
-            let mut seen = BTreeMap::<String, String>::new();
             while let Some((key, entry)) = map.next_entry::<RelativePath, SnapshotEntry>()? {
-                let mut prefix = String::new();
-                for part in key.as_str().split('/') {
-                    if !prefix.is_empty() {
-                        prefix.push('/');
-                    }
-                    prefix.push_str(part);
-                    let folded = prefix.as_str().case_fold().collect::<String>();
-                    if let Some(previous) = seen.insert(folded, prefix.clone()) {
-                        if previous != prefix {
-                            return Err(M::Error::custom(format!(
-                                "case-insensitive collision: {previous} and {prefix}"
-                            )));
-                        }
-                    }
-                }
                 if entries.insert(key, entry).is_some() {
                     return Err(M::Error::custom("duplicate snapshot path"));
                 }
             }
-            for (key, entry) in &entries {
-                if !matches!(entry, SnapshotEntry::File { .. }) {
-                    continue;
-                }
-                let mut prefix = key.as_str();
-                while let Some((parent, _)) = prefix.rsplit_once('/') {
-                    if matches!(
-                        entries.get(&RelativePath(parent.to_owned())),
-                        Some(SnapshotEntry::File { .. })
-                    ) {
-                        return Err(M::Error::custom(format!(
-                            "live file is an ancestor of another live file: {parent} and {}",
-                            key.as_str()
-                        )));
-                    }
-                    prefix = parent;
-                }
-            }
+            validate_entries(&entries).map_err(M::Error::custom)?;
             Ok(entries)
         }
     }
@@ -210,6 +339,7 @@ impl From<serde_json::Error> for SyncError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sync::reconcile::FileBaseline;
     use std::collections::BTreeMap;
 
     #[test]
@@ -258,6 +388,94 @@ mod tests {
             commit_json.find("touchHLE_apps").unwrap()
                 < commit_json.find("touchHLE_sandbox").unwrap()
         );
+    }
+
+    #[test]
+    fn loader_distinguishes_missing_legacy_and_current_checkpoints() {
+        assert!(matches!(
+            load_sync_state(None).unwrap(),
+            LoadedSyncState::Missing
+        ));
+        let old = SyncState {
+            device_id: Uuid::new_v4(),
+            last_applied_commit: Some(Uuid::new_v4()),
+            baseline: BTreeMap::from([(
+                RelativePath::new("touchHLE_apps/save").unwrap(),
+                SnapshotEntry::Tombstone,
+            )]),
+        };
+        assert!(matches!(
+            load_sync_state(Some(&serde_json::to_vec(&old).unwrap())).unwrap(),
+            LoadedSyncState::Legacy(state) if state == old
+        ));
+        let path = RelativePath::new("touchHLE_apps/save").unwrap();
+        let current = CurrentSyncState {
+            schema_version: CURRENT_SCHEMA_VERSION,
+            device_id: Uuid::new_v4(),
+            account_id: Some("account".into()),
+            root_folder_id: Some("root".into()),
+            changes_cursor: Some("cursor".into()),
+            baseline: BTreeMap::from([(
+                path.clone(),
+                FileBaseline {
+                    sha256: Some([42; 32]),
+                    remote_id: Some("id".into()),
+                    remote_version: Some("9".into()),
+                },
+            )]),
+            file_paths_by_id: BTreeMap::from([("id".into(), path.clone())]),
+            folder_paths_by_id: BTreeMap::new(),
+        };
+        assert!(matches!(
+            load_sync_state(Some(&serde_json::to_vec(&current).unwrap())).unwrap(),
+            LoadedSyncState::Current(state) if state == current
+        ));
+    }
+
+    #[test]
+    fn loader_rejects_corruption_unknown_versions_and_incomplete_legacy() {
+        for json in [
+            b"not json".as_slice(),
+            br#"{}"#,
+            br#"{"device_id":"00000000-0000-0000-0000-000000000000","baseline":{}}"#,
+            br#"{"schema_version":999}"#,
+            br#"{"device_id":"00000000-0000-0000-0000-000000000000","last_applied_commit":null,"baseline":{"touchHLE_apps/x":"Tombstone","touchHLE_apps/x":"Tombstone"}}"#,
+        ] {
+            assert!(matches!(
+                load_sync_state(Some(json)),
+                Err(SyncError::Integrity(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn deleted_baselines_are_kept_only_for_pending_local_comparison() {
+        let path = RelativePath::new("touchHLE_apps/deleted").unwrap();
+        let mut state = CurrentSyncState::new(Uuid::new_v4());
+        state.baseline.insert(
+            path.clone(),
+            FileBaseline {
+                sha256: Some([1; 32]),
+                remote_id: Some("id".into()),
+                remote_version: Some("1".into()),
+            },
+        );
+        state.file_paths_by_id.insert("id".into(), path.clone());
+        state.prune_deleted_paths(
+            &BTreeMap::from([(
+                path.clone(),
+                SnapshotEntry::File {
+                    sha256: [2; 32],
+                    size: 1,
+                    modified_unix_ms: 0,
+                },
+            )]),
+            &BTreeMap::new(),
+        );
+        assert!(state.baseline.contains_key(&path));
+        state.prune_deleted_paths(&BTreeMap::new(), &BTreeMap::new());
+        assert!(state.baseline.is_empty());
+        assert!(state.file_paths_by_id.is_empty());
     }
 
     #[test]
