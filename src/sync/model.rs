@@ -202,16 +202,26 @@ fn deserialize_baseline<'de, D: Deserializer<'de>>(
         }
 
         fn visit_map<M: MapAccess<'de>>(self, mut map: M) -> Result<Self::Value, M::Error> {
-            let mut entries = BTreeMap::new();
+            let mut entries: BTreeMap<RelativePath, FileBaseline> = BTreeMap::new();
             while let Some((path, baseline)) = map.next_entry()? {
                 if entries.insert(path, baseline).is_some() {
                     return Err(M::Error::custom("duplicate baseline path"));
                 }
             }
             let paths = entries
-                .keys()
-                .cloned()
-                .map(|path| (path, SnapshotEntry::Tombstone))
+                .iter()
+                .map(|(path, baseline)| {
+                    (
+                        path.clone(),
+                        baseline.sha256.map_or(SnapshotEntry::Tombstone, |sha256| {
+                            SnapshotEntry::File {
+                                sha256,
+                                size: 0,
+                                modified_unix_ms: 0,
+                            }
+                        }),
+                    )
+                })
                 .collect();
             validate_entries(&paths).map_err(M::Error::custom)?;
             Ok(entries)
@@ -446,6 +456,41 @@ mod tests {
                 Err(SyncError::Integrity(_))
             ));
         }
+    }
+
+    #[test]
+    fn current_baseline_rejects_live_file_ancestors_but_allows_deleted_ancestor() {
+        let parent = RelativePath::new("touchHLE_apps/foo").unwrap();
+        let child = RelativePath::new("touchHLE_apps/foo/bar").unwrap();
+        let mut current = CurrentSyncState::new(Uuid::new_v4());
+        current.baseline.insert(
+            parent.clone(),
+            FileBaseline {
+                sha256: Some([1; 32]),
+                remote_id: Some("parent-id".into()),
+                remote_version: Some("1".into()),
+            },
+        );
+        current.baseline.insert(
+            child.clone(),
+            FileBaseline {
+                sha256: Some([2; 32]),
+                remote_id: Some("child-id".into()),
+                remote_version: Some("1".into()),
+            },
+        );
+        let bytes = serde_json::to_vec(&current).unwrap();
+        assert!(matches!(
+            load_sync_state(Some(&bytes)),
+            Err(SyncError::Integrity(_))
+        ));
+
+        current.baseline.get_mut(&parent).unwrap().sha256 = None;
+        let bytes = serde_json::to_vec(&current).unwrap();
+        assert!(matches!(
+            load_sync_state(Some(&bytes)),
+            Ok(LoadedSyncState::Current(_))
+        ));
     }
 
     #[test]

@@ -166,16 +166,38 @@ pub fn plan_sync(
         })
         .collect::<Result<_, _>>()?;
     validate_entries(&remote_entries).map_err(SyncError::Integrity)?;
+    let baseline_entries: BTreeMap<_, _> = baseline
+        .iter()
+        .map(|(path, file)| {
+            (
+                path.clone(),
+                file.sha256
+                    .map_or(SnapshotEntry::Tombstone, |sha256| SnapshotEntry::File {
+                        sha256,
+                        size: 0,
+                        modified_unix_ms: 0,
+                    }),
+            )
+        })
+        .collect();
+    validate_entries(&baseline_entries).map_err(SyncError::Integrity)?;
     let paths: BTreeSet<_> = baseline
         .keys()
         .chain(local.keys())
         .chain(remote.keys())
         .cloned()
         .collect();
-    let mut combined = BTreeMap::new();
-    for path in &paths {
-        combined.insert(path.clone(), SnapshotEntry::Tombstone);
-    }
+    let mut combined: BTreeMap<_, _> = paths
+        .iter()
+        .cloned()
+        .map(|path| (path, SnapshotEntry::Tombstone))
+        .collect();
+    combined.extend(
+        local
+            .iter()
+            .map(|(path, entry)| (path.clone(), entry.clone())),
+    );
+    combined.extend(remote_entries);
     validate_entries(&combined).map_err(SyncError::Integrity)?;
 
     let mut plan = SyncPlan::default();
@@ -416,5 +438,24 @@ mod tests {
             ),
             Err(SyncError::Integrity(_))
         ));
+    }
+
+    #[test]
+    fn plan_rejects_live_file_ancestor_across_local_and_remote_trees() {
+        let local_path = RelativePath::new("touchHLE_apps/foo").unwrap();
+        let remote_path = RelativePath::new("touchHLE_apps/foo/bar").unwrap();
+        let remote_file = RemoteFile {
+            path: remote_path.clone(),
+            id: "child-id".into(),
+            version: "1".into(),
+            entry: entry(2),
+            parent_id: None,
+        };
+        let result = plan_sync(
+            &BTreeMap::new(),
+            &BTreeMap::from([(local_path, entry(1))]),
+            &BTreeMap::from([(remote_path, remote_file)]),
+        );
+        assert!(matches!(result, Err(SyncError::Integrity(_))));
     }
 }
