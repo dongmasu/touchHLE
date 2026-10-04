@@ -114,8 +114,13 @@ pub fn handle_events(env: &mut Environment) -> Option<Instant> {
     while let Some(event) = env.window_mut().pop_event() {
         match event {
             Event::Quit => {
-                echo!("User requested quit, exiting without guest lifecycle callbacks.");
+                if !env.exit_requested() {
+                    echo!(
+                        "User requested quit; returning to host without guest lifecycle callbacks."
+                    );
+                }
                 ui_application::exit_from_user_request(env);
+                return None;
             }
             Event::TouchesDown(..) | Event::TouchesMove(..) | Event::TouchesUp(..) => {
                 ui_touch::handle_event(env, event)

@@ -17,6 +17,10 @@ use crate::gles::{create_gles1_ctx_no_parent_stack, GLESContext, GLES};
 use crate::image::Image;
 use crate::matrix::Matrix;
 use crate::options::Options;
+#[cfg(not(target_os = "android"))]
+use crate::sync::model::{LocalOrRemote, SnapshotEntry};
+#[cfg(not(target_os = "android"))]
+use crate::sync::reconcile::{ConflictChoice, RemoteVersionId, SyncPlan};
 use crate::Environment;
 use sdl2::mouse::{MouseButton, MouseWheelDirection};
 use sdl2::pixels::PixelFormatEnum;
@@ -289,6 +293,47 @@ fn set_sdl2_orientation(orientation: DeviceOrientation) {
     );
 }
 
+fn set_sdl2_picker_orientations() {
+    sdl2::hint::set(
+        "SDL_IOS_ORIENTATIONS",
+        "Portrait LandscapeLeft LandscapeRight",
+    );
+}
+
+fn device_orientation_from_display(
+    orientation: sdl2_sys::SDL_DisplayOrientation,
+) -> Option<DeviceOrientation> {
+    match orientation {
+        sdl2_sys::SDL_DisplayOrientation::SDL_ORIENTATION_LANDSCAPE => {
+            Some(DeviceOrientation::LandscapeLeft)
+        }
+        sdl2_sys::SDL_DisplayOrientation::SDL_ORIENTATION_LANDSCAPE_FLIPPED => {
+            Some(DeviceOrientation::LandscapeRight)
+        }
+        sdl2_sys::SDL_DisplayOrientation::SDL_ORIENTATION_PORTRAIT => {
+            Some(DeviceOrientation::Portrait)
+        }
+        sdl2_sys::SDL_DisplayOrientation::SDL_ORIENTATION_PORTRAIT_FLIPPED => {
+            Some(DeviceOrientation::PortraitUpsideDown)
+        }
+        sdl2_sys::SDL_DisplayOrientation::SDL_ORIENTATION_UNKNOWN => None,
+    }
+}
+
+fn picker_scale_hack(
+    display_size: (u32, u32),
+    family: DeviceFamily,
+    orientation: DeviceOrientation,
+) -> NonZeroU32 {
+    let (display_width, display_height) = rotate_fullscreen_size(orientation, display_size);
+    let (logical_width, logical_height) =
+        size_for_orientation(family, orientation, NonZeroU32::new(1).unwrap());
+    let scale = (display_width / logical_width)
+        .min(display_height / logical_height)
+        .clamp(1, 4);
+    NonZeroU32::new(scale).unwrap()
+}
+
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 pub enum FingerId {
     Mouse,
@@ -416,6 +461,7 @@ pub struct Window {
     /// Copy of `fullscreen` on [Options]. Note that this is meaningless when
     /// [Self::rotatable_fullscreen] returns [true].
     fullscreen: bool,
+    picker_auto_rotate: bool,
     scale_hack: NonZeroU32,
     last_window_size: (u32, u32),
     internal_gl_ins: Option<Box<dyn GLESContext>>,
@@ -445,6 +491,7 @@ pub struct Window {
     /// certain SDL functions (that call JNI functions) are on the main
     /// stack on Android.
     pub(super) on_main_stack: bool,
+    guest_launch_started_at: Option<Instant>,
 }
 
 impl Window {
@@ -458,7 +505,8 @@ impl Window {
         title: &str,
         icon: Option<Image>,
         launch_image: Option<Image>,
-        options: &Options,
+        options: &mut Options,
+        is_app_picker: bool,
     ) -> Window {
         #[cfg(target_os = "macos")]
         // Let SDL expose MacBook trackpad contacts through the touch event path.
@@ -492,6 +540,26 @@ impl Window {
         // here, and then the app can disable it if it wants to.
         video_ctx.enable_screen_saver();
 
+        let picker_auto_rotate = is_app_picker && Self::rotatable_fullscreen();
+        if picker_auto_rotate {
+            set_sdl2_picker_orientations();
+            let display_size = video_ctx.display_bounds(0).unwrap().size();
+            let orientation = unsafe { sdl2_sys::SDL_GetDisplayOrientation(0) };
+            options.initial_orientation =
+                device_orientation_from_display(orientation).unwrap_or(options.initial_orientation);
+            options.scale_hack = picker_scale_hack(
+                display_size,
+                options.device_family.unwrap_or(DeviceFamily::iPhone),
+                options.initial_orientation,
+            );
+            log!(
+                "Android picker display {:?}, orientation {:?}, render scale {}x",
+                display_size,
+                options.initial_orientation,
+                options.scale_hack
+            );
+        }
+
         let scale_hack = options.scale_hack;
         // TODO: some apps specify their orientation in Info.plist, we could use
         // that here.
@@ -501,15 +569,27 @@ impl Window {
 
         let mut window = if Self::rotatable_fullscreen() {
             // Without this, SDL will force fullscreen mode to be portrait.
-            set_sdl2_orientation(device_orientation);
+            if !picker_auto_rotate {
+                set_sdl2_orientation(device_orientation);
+            }
             let screen_size = video_ctx.display_bounds(0).unwrap().size();
             let (width, height) = rotate_fullscreen_size(device_orientation, screen_size);
-            let window = video_ctx
-                .window(title, width, height)
-                .fullscreen()
-                .opengl()
-                .build()
-                .unwrap();
+            let window = if picker_auto_rotate {
+                video_ctx
+                    .window(title, width, height)
+                    .fullscreen()
+                    .opengl()
+                    .resizable()
+                    .build()
+                    .unwrap()
+            } else {
+                video_ctx
+                    .window(title, width, height)
+                    .fullscreen()
+                    .opengl()
+                    .build()
+                    .unwrap()
+            };
             window
         } else if fullscreen {
             let (width, height) = video_ctx.display_bounds(0).unwrap().size();
@@ -581,6 +661,7 @@ impl Window {
             #[cfg(target_os = "macos")]
             viewport_y_offset: 0,
             fullscreen,
+            picker_auto_rotate,
             scale_hack,
             last_window_size: initial_window_size,
             internal_gl_ins: None,
@@ -612,6 +693,7 @@ impl Window {
             wheel_pinch_last_event: None,
             rotation_modifier_down: false,
             on_main_stack: true,
+            guest_launch_started_at: None,
         };
 
         // Set up OpenGL ES context used for splash screen and app UI rendering
@@ -647,6 +729,13 @@ impl Window {
             return;
         }
         self.last_polled = now;
+
+        if self.picker_auto_rotate {
+            let display_orientation = unsafe { sdl2_sys::SDL_GetDisplayOrientation(0) };
+            if let Some(orientation) = device_orientation_from_display(display_orientation) {
+                self.device_orientation = orientation;
+            }
+        }
 
         fn transform_input_coords(
             window: &Window,
@@ -1993,8 +2082,18 @@ impl Window {
 
     /// Swap front-buffer and back-buffer so the result of OpenGL rendering is
     /// presented.
-    pub fn swap_window(&self) {
+    pub fn set_guest_launch_started_at(&mut self, started_at: Instant) {
+        self.guest_launch_started_at = Some(started_at);
+    }
+
+    pub fn swap_window(&mut self) {
         self.window.gl_swap_window();
+        if let Some(started_at) = self.guest_launch_started_at.take() {
+            log!(
+                "First guest frame presented {} ms after app selection",
+                started_at.elapsed().as_millis()
+            );
+        }
     }
 
     /// Consider the emulated device to be rotated to a particular orientation.
@@ -2083,9 +2182,21 @@ impl Window {
     pub fn size_unrotated_unscaled(&self) -> (u32, u32) {
         size_for_orientation(
             self.device_family,
-            DeviceOrientation::Portrait,
+            if self.picker_auto_rotate {
+                self.device_orientation
+            } else {
+                DeviceOrientation::Portrait
+            },
             NonZeroU32::new(1).unwrap(),
         )
+    }
+
+    pub fn is_picker_auto_rotating(&self) -> bool {
+        self.picker_auto_rotate
+    }
+
+    pub fn logical_screen_size(&self, orientation: DeviceOrientation) -> (u32, u32) {
+        size_for_orientation(self.device_family, orientation, NonZeroU32::new(1).unwrap())
     }
 
     /// Get the region of the on-screen window (x, y, width, height) used to
@@ -2131,6 +2242,10 @@ impl Window {
     /// rotating texture co-ordinates to display the image in the window; when
     /// rotating input co-ordinates, invert the matrix.
     pub fn rotation_matrix(&self) -> Matrix<2> {
+        if self.picker_auto_rotate {
+            // The host picker reflows upright views instead of rotating a guest app's canvas.
+            return Matrix::identity();
+        }
         match self.device_orientation {
             DeviceOrientation::Portrait => Matrix::identity(),
             DeviceOrientation::PortraitUpsideDown => Matrix::z_rotation(PI),
@@ -2266,6 +2381,1201 @@ pub fn show_error_messagebox(window: Option<&Window>, error_message: &str) {
                 _ => unreachable!(),
             }
         }
+    }
+}
+
+#[cfg(not(target_os = "android"))]
+pub fn ask_sync_offline_choice(reason: &str) -> Result<bool, String> {
+    use sdl2::messagebox;
+    let buttons = [
+        messagebox::ButtonData {
+            flags: messagebox::MessageBoxButtonFlag::NOTHING,
+            button_id: 0,
+            text: "Retry",
+        },
+        messagebox::ButtonData {
+            flags: messagebox::MessageBoxButtonFlag::NOTHING,
+            button_id: 1,
+            text: "Continue offline",
+        },
+    ];
+    match messagebox::show_message_box(
+        messagebox::MessageBoxFlag::WARNING,
+        &buttons,
+        "Google Drive sync unavailable",
+        &format!("{reason}\n\nRetry the sync, or continue offline for this session?"),
+        None,
+        None,
+    )
+    .map_err(|error| error.to_string())?
+    {
+        messagebox::ClickedButton::CustomButton(button) => match button.button_id {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err("No Google Drive sync action was selected".into()),
+        },
+        messagebox::ClickedButton::CloseButton => {
+            Err("No Google Drive sync action was selected".into())
+        }
+    }
+}
+
+#[cfg(not(target_os = "android"))]
+pub fn ask_sync_shutdown_retry(reason: &str) -> Result<bool, String> {
+    use sdl2::messagebox;
+    let buttons = [
+        messagebox::ButtonData {
+            flags: messagebox::MessageBoxButtonFlag::NOTHING,
+            button_id: 0,
+            text: "Retry",
+        },
+        messagebox::ButtonData {
+            flags: messagebox::MessageBoxButtonFlag::NOTHING,
+            button_id: 1,
+            text: "Exit and keep local data",
+        },
+    ];
+    match messagebox::show_message_box(
+        messagebox::MessageBoxFlag::WARNING,
+        &buttons,
+        "Final Google Drive sync did not finish",
+        &format!("{reason}\n\nRetry, or exit with your local data preserved?"),
+        None,
+        None,
+    )
+    .map_err(|error| error.to_string())?
+    {
+        messagebox::ClickedButton::CustomButton(button) => match button.button_id {
+            0 => Ok(true),
+            1 => Ok(false),
+            _ => Err("No shutdown sync action was selected".into()),
+        },
+        messagebox::ClickedButton::CloseButton => Ok(false),
+    }
+}
+
+#[cfg(target_os = "android")]
+pub fn run_with_sync_progress<T: Send>(
+    _title: &str,
+    operation: impl FnOnce(&mut dyn FnMut(crate::sync::progress::SyncProgress)) -> T + Send,
+) -> T {
+    use crate::sync::progress::{SyncProgress, SyncProgressDisplay};
+
+    let initial = SyncProgress::Scanning { files: 0, bytes: 0 }.display();
+    crate::sync::auth::android::update_sync_progress(Some(initial));
+    let mut last_update = Instant::now();
+    let mut last_headline = String::new();
+    let mut report = |progress: crate::sync::progress::SyncProgress| {
+        let display = progress.display();
+        if display.headline != last_headline || last_update.elapsed() >= Duration::from_millis(100)
+        {
+            crate::sync::auth::android::update_sync_progress(Some(display.clone()));
+            last_update = Instant::now();
+            last_headline = display.headline.to_owned();
+        }
+    };
+    let result = operation(&mut report);
+    crate::sync::auth::android::update_sync_progress(None::<SyncProgressDisplay>);
+    result
+}
+
+#[cfg(not(target_os = "android"))]
+pub fn run_with_sync_progress<T: Send>(
+    title: &str,
+    operation: impl FnOnce(&mut dyn FnMut(crate::sync::progress::SyncProgress)) -> T + Send,
+) -> T {
+    use std::sync::mpsc;
+
+    let mut window = match SyncProgressWindow::new(title) {
+        Ok(window) => window,
+        Err(error) => {
+            log!("Could not show sync progress window: {error}");
+            let mut ignore = |_| {};
+            return operation(&mut ignore);
+        }
+    };
+    window.canvas.window_mut().show();
+    window.canvas.window_mut().raise();
+    window.draw();
+    log!("Sync progress window shown and raised before the operation started");
+    let (sender, receiver) = mpsc::channel();
+    std::thread::scope(|scope| {
+        let worker = scope.spawn(move || {
+            let mut report = |progress| {
+                let _ = sender.send(progress);
+            };
+            operation(&mut report)
+        });
+        let mut restored_focus_after_progress = false;
+        while !worker.is_finished() {
+            window.poll_events();
+            while let Ok(progress) = receiver.try_recv() {
+                window.set_progress(progress);
+                if !restored_focus_after_progress {
+                    window.canvas.window_mut().raise();
+                    log!("Sync progress window re-raised after the first sync progress update");
+                    restored_focus_after_progress = true;
+                }
+            }
+            window.draw();
+            std::thread::sleep(Duration::from_millis(40));
+        }
+        while let Ok(progress) = receiver.try_recv() {
+            window.set_progress(progress);
+        }
+        window.draw();
+        worker.join().expect("cloud sync worker panicked")
+    })
+}
+
+#[cfg(not(target_os = "android"))]
+struct SyncProgressWindow {
+    _sdl: sdl2::Sdl,
+    canvas: sdl2::render::Canvas<sdl2::video::Window>,
+    event_pump: sdl2::EventPump,
+    font: rusttype::Font<'static>,
+    scale_x: f32,
+    scale_y: f32,
+    progress: crate::sync::progress::SyncProgress,
+    animation_frame: usize,
+}
+
+#[cfg(not(target_os = "android"))]
+impl SyncProgressWindow {
+    fn new(title: &str) -> Result<Self, String> {
+        use std::io::Read;
+
+        let sdl = sdl2::init()?;
+        let video = sdl.video()?;
+        let window = video
+            .window(title, 620, 310)
+            .position_centered()
+            .allow_highdpi()
+            .build()
+            .map_err(|error| error.to_string())?;
+        let canvas = window
+            .into_canvas()
+            .build()
+            .map_err(|error| error.to_string())?;
+        let (output_width, output_height) = canvas.output_size()?;
+        let scale_x = output_width as f32 / 620.0;
+        let scale_y = output_height as f32 / 310.0;
+        let mut font_bytes = Vec::new();
+        crate::paths::ResourceFile::open(&format!(
+            "{}/LiberationSans-Regular.ttf",
+            crate::paths::FONTS_DIR
+        ))?
+        .get()
+        .read_to_end(&mut font_bytes)
+        .map_err(|error| error.to_string())?;
+        let font = rusttype::Font::try_from_vec(font_bytes)
+            .ok_or_else(|| "bundled sync progress font could not be loaded".to_owned())?;
+        let event_pump = sdl.event_pump()?;
+        Ok(Self {
+            _sdl: sdl,
+            canvas,
+            event_pump,
+            font,
+            scale_x,
+            scale_y,
+            progress: crate::sync::progress::SyncProgress::Scanning { files: 0, bytes: 0 },
+            animation_frame: 0,
+        })
+    }
+
+    fn set_progress(&mut self, progress: crate::sync::progress::SyncProgress) {
+        self.progress = progress;
+    }
+
+    fn poll_events(&mut self) {
+        for event in self.event_pump.poll_iter() {
+            if matches!(event, sdl2::event::Event::Quit { .. }) {
+                // Closing this window must not silently bypass the launch gate.
+            }
+        }
+    }
+
+    fn draw(&mut self) {
+        use sdl2::pixels::Color;
+
+        let background = Color::RGB(246, 246, 242);
+        let foreground = Color::RGB(31, 42, 46);
+        let muted = Color::RGB(93, 107, 108);
+        let accent = Color::RGB(28, 111, 104);
+        let track = Color::RGB(218, 225, 221);
+        self.canvas.set_draw_color(background);
+        self.canvas.clear();
+        self.canvas.set_blend_mode(sdl2::render::BlendMode::Blend);
+
+        let display = self.progress.display();
+        self.draw_text("Google Drive Sync", 42, 34, 25.0, foreground);
+        self.draw_text(display.headline, 42, 99, 19.0, foreground);
+        self.draw_text(&display.detail, 42, 132, 14.0, muted);
+        self.draw_text(
+            "Local scan",
+            42,
+            190,
+            12.0,
+            if display.active_step == 0 {
+                accent
+            } else {
+                muted
+            },
+        );
+        self.draw_text(
+            "Drive check",
+            174,
+            190,
+            12.0,
+            if display.active_step >= 1 {
+                accent
+            } else {
+                muted
+            },
+        );
+        self.draw_text(
+            "Transfer",
+            318,
+            190,
+            12.0,
+            if display.active_step >= 2 {
+                accent
+            } else {
+                muted
+            },
+        );
+        self.draw_text(
+            "Apply",
+            468,
+            190,
+            12.0,
+            if display.active_step >= 3 {
+                accent
+            } else {
+                muted
+            },
+        );
+
+        let bar_y = 218;
+        self.fill_logical_rect(42, bar_y, 526, 5, track);
+        self.fill_logical_rect(42, bar_y, display.track_progress.into(), 5, accent);
+        let pulse_x = 42 + (self.animation_frame % 28) as i32 * 18;
+        self.fill_logical_rect(pulse_x, 246, 18, 3, Color::RGB(255, 255, 255));
+        self.fill_logical_rect(42, 246, 504, 1, muted);
+        self.draw_text(
+            "Please keep touchHLE open until sync finishes.",
+            42,
+            263,
+            12.0,
+            muted,
+        );
+        self.canvas.present();
+        self.animation_frame = self.animation_frame.wrapping_add(1);
+    }
+
+    fn draw_text(&mut self, text: &str, x: i32, y: i32, size: f32, color: sdl2::pixels::Color) {
+        use rusttype::{point, Scale};
+        use sdl2::rect::Rect;
+
+        let scale = Scale::uniform(size * self.scale_y);
+        let baseline = y as f32 * self.scale_y + self.font.v_metrics(scale).ascent;
+        let glyphs: Vec<_> = self
+            .font
+            .layout(text, scale, point(x as f32 * self.scale_x, baseline))
+            .collect();
+        let canvas = &mut self.canvas;
+        for glyph in glyphs {
+            let Some(bounds) = glyph.pixel_bounding_box() else {
+                continue;
+            };
+            glyph.draw(|gx, gy, coverage| {
+                if coverage <= 0.0 {
+                    return;
+                }
+                let alpha = (coverage * 255.0) as u8;
+                canvas.set_draw_color(sdl2::pixels::Color::RGBA(color.r, color.g, color.b, alpha));
+                let _ = canvas.fill_rect(Rect::new(
+                    bounds.min.x + gx as i32,
+                    bounds.min.y + gy as i32,
+                    1,
+                    1,
+                ));
+            });
+        }
+    }
+
+    fn fill_logical_rect(
+        &mut self,
+        x: i32,
+        y: i32,
+        width: u32,
+        height: u32,
+        color: sdl2::pixels::Color,
+    ) {
+        use sdl2::rect::Rect;
+
+        let x = (x as f32 * self.scale_x).round() as i32;
+        let y = (y as f32 * self.scale_y).round() as i32;
+        let width = (width as f32 * self.scale_x).round().max(1.0) as u32;
+        let height = (height as f32 * self.scale_y).round().max(1.0) as u32;
+        self.canvas.set_draw_color(color);
+        let _ = self.canvas.fill_rect(Rect::new(x, y, width, height));
+    }
+}
+
+#[cfg(not(target_os = "android"))]
+pub fn resolve_sync_conflicts(plan: &SyncPlan) -> Result<Option<Vec<ConflictChoice>>, String> {
+    if plan.conflicts.is_empty() {
+        return Ok(Some(Vec::new()));
+    }
+    Ok(SyncConflictWindow::new(plan.clone())?.run())
+}
+
+#[cfg(not(target_os = "android"))]
+struct SyncConflictWindow {
+    _sdl: sdl2::Sdl,
+    canvas: sdl2::render::Canvas<sdl2::video::Window>,
+    event_pump: sdl2::EventPump,
+    font: rusttype::Font<'static>,
+    scale_x: f32,
+    scale_y: f32,
+    plan: SyncPlan,
+    local_root: String,
+    conflict_idx: usize,
+    selected: Vec<Option<usize>>,
+    cloud_versions: Vec<usize>,
+    message: String,
+}
+
+#[cfg(not(target_os = "android"))]
+impl SyncConflictWindow {
+    const WIDTH: u32 = 980;
+    const HEIGHT: u32 = 720;
+
+    fn new(plan: SyncPlan) -> Result<Self, String> {
+        use std::io::Read;
+
+        let sdl = sdl2::init()?;
+        let video = sdl.video()?;
+        let window = video
+            .window(
+                "Resolve Google Drive sync conflicts",
+                Self::WIDTH,
+                Self::HEIGHT,
+            )
+            .position_centered()
+            .allow_highdpi()
+            .build()
+            .map_err(|error| error.to_string())?;
+        let canvas = window
+            .into_canvas()
+            .build()
+            .map_err(|error| error.to_string())?;
+        let (output_width, output_height) = canvas.output_size()?;
+        let scale_x = output_width as f32 / Self::WIDTH as f32;
+        let scale_y = output_height as f32 / Self::HEIGHT as f32;
+        let mut font_bytes = Vec::new();
+        crate::paths::ResourceFile::open(&format!(
+            "{}/LiberationSans-Regular.ttf",
+            crate::paths::FONTS_DIR
+        ))?
+        .get()
+        .read_to_end(&mut font_bytes)
+        .map_err(|error| error.to_string())?;
+        let font = rusttype::Font::try_from_vec(font_bytes)
+            .ok_or_else(|| "bundled conflict resolver font could not be loaded".to_owned())?;
+        let event_pump = sdl.event_pump()?;
+        let count = plan.conflicts.len();
+        let local_root = crate::paths::user_data_base_path()
+            .canonicalize()
+            .unwrap_or_else(|_| crate::paths::user_data_base_path().to_path_buf())
+            .display()
+            .to_string();
+        Ok(Self {
+            _sdl: sdl,
+            canvas,
+            event_pump,
+            font,
+            scale_x,
+            scale_y,
+            plan,
+            local_root,
+            conflict_idx: 0,
+            selected: vec![None; count],
+            cloud_versions: vec![0; count],
+            message: String::new(),
+        })
+    }
+
+    fn run(mut self) -> Option<Vec<ConflictChoice>> {
+        use sdl2::event::Event;
+        use sdl2::keyboard::Keycode;
+
+        self.canvas.window_mut().show();
+        self.canvas.window_mut().raise();
+        loop {
+            self.draw();
+            let events: Vec<_> = self.event_pump.poll_iter().collect();
+            for event in events {
+                match event {
+                    Event::Quit { .. } => return None,
+                    Event::MouseButtonDown {
+                        mouse_btn: MouseButton::Left,
+                        x,
+                        y,
+                        ..
+                    } => {
+                        if let Some(choices) = self.handle_click(x, y) {
+                            return choices;
+                        }
+                    }
+                    Event::KeyDown {
+                        keycode: Some(key),
+                        repeat: false,
+                        ..
+                    } => match key {
+                        Keycode::Escape => return None,
+                        Keycode::Left => self.move_file(-1),
+                        Keycode::Right => self.move_file(1),
+                        Keycode::Up => self.move_cloud_version(-1),
+                        Keycode::Down => self.move_cloud_version(1),
+                        Keycode::L => self.select_local(),
+                        Keycode::C => self.select_cloud(),
+                        Keycode::Return | Keycode::KpEnter => {
+                            if let Some(choices) = self.try_apply() {
+                                return Some(choices);
+                            }
+                        }
+                        _ => {}
+                    },
+                    _ => {}
+                }
+            }
+            std::thread::sleep(Duration::from_millis(16));
+        }
+    }
+
+    fn handle_click(&mut self, x: i32, y: i32) -> Option<Option<Vec<ConflictChoice>>> {
+        match conflict_action_at(x, y) {
+            Some(ConflictWindowAction::SelectLocal) => self.select_local(),
+            Some(ConflictWindowAction::SelectCloud) => self.select_cloud(),
+            Some(ConflictWindowAction::PreviousCloudVersion) => self.move_cloud_version(-1),
+            Some(ConflictWindowAction::NextCloudVersion) => self.move_cloud_version(1),
+            Some(ConflictWindowAction::PreviousFile) => self.move_file(-1),
+            Some(ConflictWindowAction::NextFile) => self.move_file(1),
+            Some(ConflictWindowAction::Apply) => return self.try_apply().map(Some),
+            Some(ConflictWindowAction::Cancel) => return Some(None),
+            None => {}
+        }
+        None
+    }
+
+    fn select_local(&mut self) {
+        self.selected[self.conflict_idx] = Some(0);
+        self.message = "Keep Local selected for this file.".to_owned();
+    }
+
+    fn select_cloud(&mut self) {
+        if self.plan.conflicts[self.conflict_idx]
+            .remote_candidates
+            .is_empty()
+        {
+            self.message = "No Cloud version is available for this file.".to_owned();
+            return;
+        }
+        self.selected[self.conflict_idx] = Some(self.cloud_versions[self.conflict_idx] + 1);
+        self.message = "Use Cloud selected for this file.".to_owned();
+    }
+
+    fn move_file(&mut self, delta: isize) {
+        self.conflict_idx = (self.conflict_idx as isize + delta)
+            .clamp(0, self.plan.conflicts.len() as isize - 1) as usize;
+        if let Some(selected) = self.selected[self.conflict_idx] {
+            if selected > 0 {
+                self.cloud_versions[self.conflict_idx] = selected - 1;
+            }
+        }
+        self.message.clear();
+    }
+
+    fn move_cloud_version(&mut self, delta: isize) {
+        let count = self.plan.conflicts[self.conflict_idx]
+            .remote_candidates
+            .len();
+        if count == 0 {
+            return;
+        }
+        self.cloud_versions[self.conflict_idx] = (self.cloud_versions[self.conflict_idx] as isize
+            + delta)
+            .rem_euclid(count as isize) as usize;
+        self.message.clear();
+    }
+
+    fn try_apply(&mut self) -> Option<Vec<ConflictChoice>> {
+        let missing: Vec<_> = self
+            .selected
+            .iter()
+            .enumerate()
+            .filter_map(|(index, selected)| selected.is_none().then_some(index + 1))
+            .collect();
+        if !missing.is_empty() {
+            self.message = format!(
+                "Choose Keep Local or Use Cloud for conflict{} {}.",
+                if missing.len() == 1 { "" } else { "s" },
+                missing
+                    .iter()
+                    .map(usize::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            return None;
+        }
+        let choices: Vec<_> = self
+            .plan
+            .conflicts
+            .iter()
+            .zip(&self.selected)
+            .map(|(conflict, selected)| {
+                let selected = selected.expect("missing choices were checked");
+                if selected == 0 {
+                    ConflictChoice {
+                        path: conflict.path.clone(),
+                        selected: LocalOrRemote::Local,
+                        remote_version_id: None,
+                    }
+                } else {
+                    ConflictChoice {
+                        path: conflict.path.clone(),
+                        selected: LocalOrRemote::Remote,
+                        remote_version_id: Some(
+                            conflict.remote_candidates[selected - 1].id.clone(),
+                        ),
+                    }
+                }
+            })
+            .collect();
+        match self.plan.resolved_snapshot(&choices) {
+            Ok(_) => Some(choices),
+            Err(crate::sync::model::SyncError::UnresolvedConflicts(reason)) => {
+                self.message = format!(
+                    "These choices conflict: {reason}. Change a choice for one of these paths."
+                );
+                None
+            }
+            Err(error) => {
+                self.message = format!("Could not apply these choices: {error}");
+                None
+            }
+        }
+    }
+
+    fn draw(&mut self) {
+        use sdl2::pixels::Color;
+        let background = Color::RGB(246, 246, 242);
+        let foreground = Color::RGB(31, 42, 46);
+        let muted = Color::RGB(93, 107, 108);
+        let accent = Color::RGB(28, 111, 104);
+        let panel = Color::RGB(255, 255, 255);
+        let line = Color::RGB(218, 225, 221);
+        let selected_bg = Color::RGB(225, 241, 236);
+        self.canvas.set_draw_color(background);
+        self.canvas.clear();
+        self.canvas.set_blend_mode(sdl2::render::BlendMode::Blend);
+
+        let conflict = self.plan.conflicts[self.conflict_idx].clone();
+        let selected_count = self
+            .selected
+            .iter()
+            .filter(|choice| choice.is_some())
+            .count();
+        self.draw_text(
+            "Resolve Google Drive sync conflicts",
+            40,
+            28,
+            27.0,
+            foreground,
+        );
+        self.draw_text(
+            &format!(
+                "File {} of {}     {} of {} choices made",
+                self.conflict_idx + 1,
+                self.plan.conflicts.len(),
+                selected_count,
+                self.plan.conflicts.len()
+            ),
+            40,
+            70,
+            16.0,
+            muted,
+        );
+        self.draw_text(
+            &format!("Local files are read from: {}", self.local_root),
+            40,
+            99,
+            12.0,
+            muted,
+        );
+
+        self.fill_logical_rect(40, 130, 900, 94, panel);
+        self.draw_logical_rect(40, 130, 900, 94, line);
+        self.draw_text("CONFLICTING FILE", 60, 145, 11.0, muted);
+        self.draw_wrapped_text(conflict.path.as_str(), 60, 166, 850, 16.0, foreground, 2);
+
+        let local_selected = self.selected[self.conflict_idx] == Some(0);
+        let local_missing = !matches!(conflict.local.as_ref(), Some(SnapshotEntry::File { .. }));
+        self.draw_choice_card(
+            40,
+            244,
+            435,
+            260,
+            "This Mac",
+            describe_local_conflict_entry(conflict.local.as_ref()),
+            local_selected,
+            if local_missing {
+                "Keep Local (delete Cloud)"
+            } else {
+                "Keep Local"
+            },
+            selected_bg,
+            panel,
+            line,
+            foreground,
+            muted,
+            accent,
+        );
+        let cloud_index = self.cloud_versions[self.conflict_idx];
+        let cloud = conflict.remote_candidates.get(cloud_index);
+        let cloud_selected = self.selected[self.conflict_idx] == Some(cloud_index + 1);
+        let cloud_missing = cloud.map_or(true, |candidate| {
+            !matches!(candidate.entry.as_ref(), Some(SnapshotEntry::File { .. }))
+        });
+        self.draw_choice_card(
+            505,
+            244,
+            435,
+            260,
+            "Google Drive",
+            cloud.map_or_else(
+                || "No Cloud file is available.".to_owned(),
+                |candidate| describe_conflict_candidate(candidate),
+            ),
+            cloud_selected,
+            if cloud_missing {
+                "Use Cloud (delete Local)"
+            } else {
+                "Use Cloud"
+            },
+            selected_bg,
+            panel,
+            line,
+            foreground,
+            muted,
+            accent,
+        );
+        if conflict.remote_candidates.len() > 1 {
+            self.draw_button(
+                862, 252, 32, 32, "<", false, true, panel, line, foreground, accent,
+            );
+            self.draw_button(
+                900, 252, 32, 32, ">", false, true, panel, line, foreground, accent,
+            );
+            self.draw_text(
+                &format!(
+                    "Cloud version {} of {}",
+                    cloud_index + 1,
+                    conflict.remote_candidates.len()
+                ),
+                700,
+                260,
+                13.0,
+                muted,
+            );
+        }
+
+        if !self.message.is_empty() {
+            self.fill_logical_rect(40, 524, 900, 60, Color::RGB(255, 242, 220));
+            self.draw_wrapped_text(&self.message.clone(), 56, 536, 868, 14.0, foreground, 2);
+        }
+        self.draw_button(
+            40,
+            606,
+            184,
+            48,
+            "Previous file",
+            false,
+            self.conflict_idx > 0,
+            panel,
+            line,
+            foreground,
+            accent,
+        );
+        self.draw_button(
+            236,
+            606,
+            184,
+            48,
+            "Next file",
+            false,
+            self.conflict_idx + 1 < self.plan.conflicts.len(),
+            panel,
+            line,
+            foreground,
+            accent,
+        );
+        self.draw_button(
+            648,
+            660,
+            190,
+            46,
+            &format!("Apply ({selected_count}/{})", self.plan.conflicts.len()),
+            false,
+            selected_count == self.plan.conflicts.len(),
+            panel,
+            line,
+            foreground,
+            accent,
+        );
+        self.draw_button(
+            850, 660, 90, 46, "Cancel", false, true, panel, line, foreground, accent,
+        );
+        self.canvas.present();
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw_choice_card(
+        &mut self,
+        x: i32,
+        y: i32,
+        width: u32,
+        height: u32,
+        title: &str,
+        detail: String,
+        selected: bool,
+        button: &str,
+        selected_bg: sdl2::pixels::Color,
+        panel: sdl2::pixels::Color,
+        line: sdl2::pixels::Color,
+        foreground: sdl2::pixels::Color,
+        muted: sdl2::pixels::Color,
+        accent: sdl2::pixels::Color,
+    ) {
+        let fill = if selected { selected_bg } else { panel };
+        self.fill_logical_rect(x, y, width, height, fill);
+        self.draw_logical_rect(x, y, width, height, if selected { accent } else { line });
+        self.draw_text(title, x + 20, y + 18, 19.0, foreground);
+        self.draw_wrapped_text(&detail, x + 20, y + 60, width as i32 - 40, 14.0, muted, 5);
+        self.draw_button(
+            x + 20,
+            y + height as i32 - 72,
+            width - 40,
+            52,
+            button,
+            selected,
+            true,
+            fill,
+            line,
+            foreground,
+            accent,
+        );
+    }
+
+    fn draw_button(
+        &mut self,
+        x: i32,
+        y: i32,
+        width: u32,
+        height: u32,
+        label: &str,
+        active: bool,
+        enabled: bool,
+        background: sdl2::pixels::Color,
+        border: sdl2::pixels::Color,
+        foreground: sdl2::pixels::Color,
+        accent: sdl2::pixels::Color,
+    ) {
+        use rusttype::Scale;
+        let fill = if !enabled {
+            sdl2::pixels::Color::RGB(231, 233, 230)
+        } else if active {
+            accent
+        } else {
+            background
+        };
+        self.fill_logical_rect(x, y, width, height, fill);
+        self.draw_logical_rect(x, y, width, height, if active { accent } else { border });
+        let text_color = if active {
+            sdl2::pixels::Color::RGB(255, 255, 255)
+        } else if enabled {
+            foreground
+        } else {
+            sdl2::pixels::Color::RGB(135, 143, 140)
+        };
+        let scale = Scale::uniform(15.0 * self.scale_y);
+        let text_width: f32 = label
+            .chars()
+            .map(|character| {
+                self.font
+                    .glyph(character)
+                    .scaled(scale)
+                    .h_metrics()
+                    .advance_width
+            })
+            .sum();
+        let text_x = x as f32 + (width as f32 - text_width / self.scale_x) / 2.0;
+        let text_y = y as f32 + (height as f32 - 18.0) / 2.0;
+        self.draw_text(
+            label,
+            text_x.round() as i32,
+            text_y.round() as i32,
+            15.0,
+            text_color,
+        );
+    }
+
+    fn draw_text(&mut self, text: &str, x: i32, y: i32, size: f32, color: sdl2::pixels::Color) {
+        use rusttype::{point, Scale};
+        use sdl2::rect::Rect;
+
+        let scale = Scale::uniform(size * self.scale_y);
+        let baseline = y as f32 * self.scale_y + self.font.v_metrics(scale).ascent;
+        let glyphs: Vec<_> = self
+            .font
+            .layout(text, scale, point(x as f32 * self.scale_x, baseline))
+            .collect();
+        let canvas = &mut self.canvas;
+        for glyph in glyphs {
+            let Some(bounds) = glyph.pixel_bounding_box() else {
+                continue;
+            };
+            glyph.draw(|gx, gy, coverage| {
+                if coverage <= 0.0 {
+                    return;
+                }
+                canvas.set_draw_color(sdl2::pixels::Color::RGBA(
+                    color.r,
+                    color.g,
+                    color.b,
+                    (coverage * 255.0) as u8,
+                ));
+                let _ = canvas.fill_rect(Rect::new(
+                    bounds.min.x + gx as i32,
+                    bounds.min.y + gy as i32,
+                    1,
+                    1,
+                ));
+            });
+        }
+    }
+
+    fn draw_wrapped_text(
+        &mut self,
+        text: &str,
+        x: i32,
+        y: i32,
+        max_width: i32,
+        size: f32,
+        color: sdl2::pixels::Color,
+        max_lines: usize,
+    ) {
+        let scale = rusttype::Scale::uniform(size * self.scale_x);
+        let mut lines = Vec::new();
+        let mut line = String::new();
+        for character in text.chars().chain(std::iter::once('\n')) {
+            if character == '\n' {
+                lines.push(std::mem::take(&mut line));
+                continue;
+            }
+            let mut candidate = line.clone();
+            candidate.push(character);
+            let width: f32 = candidate
+                .chars()
+                .map(|character| {
+                    self.font
+                        .glyph(character)
+                        .scaled(scale)
+                        .h_metrics()
+                        .advance_width
+                })
+                .sum();
+            if !line.is_empty() && width > max_width as f32 * self.scale_x {
+                lines.push(std::mem::take(&mut line));
+            }
+            line.push(character);
+        }
+        if !line.is_empty() {
+            lines.push(line);
+        }
+        let clipped = lines.len() > max_lines;
+        lines.truncate(max_lines);
+        if clipped {
+            if let Some(last) = lines.last_mut() {
+                last.push_str("...");
+            }
+        }
+        for (index, line) in lines.iter().enumerate() {
+            self.draw_text(
+                line,
+                x,
+                y + index as i32 * (size.ceil() as i32 + 7),
+                size,
+                color,
+            );
+        }
+    }
+
+    fn fill_logical_rect(
+        &mut self,
+        x: i32,
+        y: i32,
+        width: u32,
+        height: u32,
+        color: sdl2::pixels::Color,
+    ) {
+        use sdl2::rect::Rect;
+        self.canvas.set_draw_color(color);
+        let _ = self.canvas.fill_rect(Rect::new(
+            (x as f32 * self.scale_x).round() as i32,
+            (y as f32 * self.scale_y).round() as i32,
+            (width as f32 * self.scale_x).round().max(1.0) as u32,
+            (height as f32 * self.scale_y).round().max(1.0) as u32,
+        ));
+    }
+
+    fn draw_logical_rect(
+        &mut self,
+        x: i32,
+        y: i32,
+        width: u32,
+        height: u32,
+        color: sdl2::pixels::Color,
+    ) {
+        use sdl2::rect::Rect;
+        self.canvas.set_draw_color(color);
+        let _ = self.canvas.draw_rect(Rect::new(
+            (x as f32 * self.scale_x).round() as i32,
+            (y as f32 * self.scale_y).round() as i32,
+            (width as f32 * self.scale_x).round().max(1.0) as u32,
+            (height as f32 * self.scale_y).round().max(1.0) as u32,
+        ));
+    }
+}
+
+#[cfg(not(target_os = "android"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ConflictWindowAction {
+    SelectLocal,
+    SelectCloud,
+    PreviousCloudVersion,
+    NextCloudVersion,
+    PreviousFile,
+    NextFile,
+    Apply,
+    Cancel,
+}
+
+#[cfg(not(target_os = "android"))]
+fn conflict_action_at(x: i32, y: i32) -> Option<ConflictWindowAction> {
+    if contains(60, 426, 400, 54, x, y) {
+        Some(ConflictWindowAction::SelectLocal)
+    } else if contains(520, 426, 400, 54, x, y) {
+        Some(ConflictWindowAction::SelectCloud)
+    } else if contains(862, 252, 32, 32, x, y) {
+        Some(ConflictWindowAction::PreviousCloudVersion)
+    } else if contains(900, 252, 32, 32, x, y) {
+        Some(ConflictWindowAction::NextCloudVersion)
+    } else if contains(40, 606, 184, 48, x, y) {
+        Some(ConflictWindowAction::PreviousFile)
+    } else if contains(236, 606, 184, 48, x, y) {
+        Some(ConflictWindowAction::NextFile)
+    } else if contains(648, 660, 190, 46, x, y) {
+        Some(ConflictWindowAction::Apply)
+    } else if contains(850, 660, 90, 46, x, y) {
+        Some(ConflictWindowAction::Cancel)
+    } else {
+        None
+    }
+}
+
+#[cfg(not(target_os = "android"))]
+fn contains(x: i32, y: i32, width: u32, height: u32, px: i32, py: i32) -> bool {
+    px >= x && py >= y && px < x + width as i32 && py < y + height as i32
+}
+
+#[cfg(test)]
+mod picker_display_tests {
+    use super::*;
+
+    #[test]
+    fn android_display_orientation_maps_to_guest_content_orientation() {
+        assert_eq!(
+            device_orientation_from_display(
+                sdl2_sys::SDL_DisplayOrientation::SDL_ORIENTATION_PORTRAIT
+            ),
+            Some(DeviceOrientation::Portrait)
+        );
+        assert_eq!(
+            device_orientation_from_display(
+                sdl2_sys::SDL_DisplayOrientation::SDL_ORIENTATION_PORTRAIT_FLIPPED
+            ),
+            Some(DeviceOrientation::PortraitUpsideDown)
+        );
+        assert_eq!(
+            device_orientation_from_display(
+                sdl2_sys::SDL_DisplayOrientation::SDL_ORIENTATION_LANDSCAPE
+            ),
+            Some(DeviceOrientation::LandscapeLeft)
+        );
+        assert_eq!(
+            device_orientation_from_display(
+                sdl2_sys::SDL_DisplayOrientation::SDL_ORIENTATION_LANDSCAPE_FLIPPED
+            ),
+            Some(DeviceOrientation::LandscapeRight)
+        );
+        assert_eq!(
+            device_orientation_from_display(
+                sdl2_sys::SDL_DisplayOrientation::SDL_ORIENTATION_UNKNOWN
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn picker_render_scale_tracks_display_and_caps_at_four() {
+        assert_eq!(
+            picker_scale_hack(
+                (1080, 2400),
+                DeviceFamily::iPhone,
+                DeviceOrientation::Portrait
+            )
+            .get(),
+            3
+        );
+        assert_eq!(
+            picker_scale_hack(
+                (2400, 1080),
+                DeviceFamily::iPhone,
+                DeviceOrientation::LandscapeLeft
+            )
+            .get(),
+            3
+        );
+        assert_eq!(
+            picker_scale_hack(
+                (720, 1280),
+                DeviceFamily::iPhone,
+                DeviceOrientation::Portrait
+            )
+            .get(),
+            2
+        );
+        assert_eq!(
+            picker_scale_hack(
+                (4000, 8000),
+                DeviceFamily::iPhone,
+                DeviceOrientation::Portrait
+            )
+            .get(),
+            4
+        );
+    }
+}
+
+#[cfg(not(target_os = "android"))]
+fn describe_local_conflict_entry(entry: Option<&SnapshotEntry>) -> String {
+    match entry {
+        None | Some(SnapshotEntry::Tombstone) => "Deleted on this Mac".to_owned(),
+        Some(SnapshotEntry::File {
+            size,
+            modified_unix_ms,
+            ..
+        }) => format!(
+            "{size} bytes\nModified (device time) {}\nSource: current touchHLE data folder",
+            crate::environment::app_picker::format_unix_ms_local(*modified_unix_ms)
+        ),
+    }
+}
+
+#[cfg(not(target_os = "android"))]
+fn describe_conflict_candidate(candidate: &crate::sync::reconcile::RemoteCandidate) -> String {
+    match (&candidate.id, &candidate.entry) {
+        (RemoteVersionId::NoDriveFile, _)
+        | (RemoteVersionId::DriveFile(_), None | Some(SnapshotEntry::Tombstone)) => {
+            return "Deleted in Google Drive".to_owned();
+        }
+        (RemoteVersionId::LegacyCommit(_), None | Some(SnapshotEntry::Tombstone)) => {
+            return "Deleted in cloud (legacy revision)".to_owned();
+        }
+        _ => {}
+    }
+    let contents = describe_local_conflict_entry(candidate.entry.as_ref());
+    let source = match (&candidate.id, &candidate.file) {
+        (RemoteVersionId::DriveFile(id), Some(file)) => {
+            format!("Drive version {} · file ID {id}", file.version)
+        }
+        (RemoteVersionId::LegacyCommit(id), _) => format!("Legacy revision {id}"),
+        (RemoteVersionId::NoDriveFile, _) => "Deleted in Google Drive".to_owned(),
+        _ => "Google Drive version".to_owned(),
+    };
+    format!("{contents}\n{source}")
+}
+
+#[cfg(all(test, not(target_os = "android")))]
+mod sync_conflict_display_tests {
+    use super::*;
+
+    #[test]
+    fn local_deletion_is_attributed_to_this_mac() {
+        assert_eq!(describe_local_conflict_entry(None), "Deleted on this Mac");
+    }
+
+    #[test]
+    fn missing_drive_file_is_attributed_to_google_drive() {
+        let candidate = crate::sync::reconcile::RemoteCandidate {
+            id: RemoteVersionId::NoDriveFile,
+            entry: None,
+            file: None,
+        };
+        assert_eq!(
+            describe_conflict_candidate(&candidate),
+            "Deleted in Google Drive"
+        );
+    }
+
+    #[test]
+    fn conflict_window_hit_testing_uses_raw_window_coordinates() {
+        assert_eq!(
+            conflict_action_at(200, 450),
+            Some(ConflictWindowAction::SelectLocal)
+        );
+        assert_eq!(
+            conflict_action_at(700, 450),
+            Some(ConflictWindowAction::SelectCloud)
+        );
+        assert_eq!(
+            conflict_action_at(132, 630),
+            Some(ConflictWindowAction::PreviousFile)
+        );
+        assert_eq!(
+            conflict_action_at(328, 630),
+            Some(ConflictWindowAction::NextFile)
+        );
+        assert_eq!(
+            conflict_action_at(878, 268),
+            Some(ConflictWindowAction::PreviousCloudVersion)
+        );
+        assert_eq!(
+            conflict_action_at(916, 268),
+            Some(ConflictWindowAction::NextCloudVersion)
+        );
+        assert_eq!(
+            conflict_action_at(700, 680),
+            Some(ConflictWindowAction::Apply)
+        );
+        assert_eq!(
+            conflict_action_at(890, 680),
+            Some(ConflictWindowAction::Cancel)
+        );
+        assert_eq!(conflict_action_at(950, 710), None);
     }
 }
 

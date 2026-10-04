@@ -456,10 +456,11 @@ pub(super) fn UIApplicationMain(
 /// A desktop close is not an iOS lifecycle transition. In particular, sending
 /// both termination callbacks here lets old apps tear down audio and other
 /// guest objects twice; some of them then free stale pointers and crash while
-/// handling `applicationWillTerminate:`. The host process is already going
-/// away, so avoid entering guest code on this path.
-pub(super) fn exit_from_user_request(_env: &mut Environment) -> ! {
-    std::process::exit(0);
+/// handling `applicationWillTerminate:`. Skip guest callbacks and return to
+/// the host so it can finish shutdown cleanup.
+pub(super) fn exit_from_user_request(env: &mut Environment) {
+    log!("Host requested exit; skipping guest lifecycle callbacks.");
+    env.request_exit(0);
 }
 
 /// Tell the app it's about to quit and then exit.
@@ -523,8 +524,8 @@ pub(super) fn exit(env: &mut Environment) {
         log!("UIApplication exit: drained terminate autorelease pool.");
     };
 
-    log!("UIApplication exit: callbacks complete; exiting process.");
-    std::process::exit(0);
+    log!("UIApplication exit: callbacks complete; requesting host shutdown.");
+    env.request_exit(0);
 }
 
 /// App life-cycle notifications

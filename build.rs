@@ -12,6 +12,22 @@ fn rerun_if_changed(path: &Path) {
 }
 
 pub fn main() {
+    const DESKTOP_OAUTH_ENV_VARS: &[&str] = &[
+        "TOUCHHLE_GOOGLE_DESKTOP_OAUTH_CLIENT_ID",
+        "TOUCHHLE_GOOGLE_DESKTOP_OAUTH_CLIENT_SECRET",
+    ];
+
+    for name in DESKTOP_OAUTH_ENV_VARS {
+        println!("cargo:rerun-if-env-changed={name}");
+    }
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("android") {
+        for name in DESKTOP_OAUTH_ENV_VARS {
+            if let Ok(value) = std::env::var(name) {
+                println!("cargo:rustc-env={name}={value}");
+            }
+        }
+    }
+
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
     let package_root = Path::new(env!("CARGO_MANIFEST_DIR"));
 

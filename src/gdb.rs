@@ -373,7 +373,7 @@ impl GdbServer {
                         todo!("TODO: Resume at {}", addr);
                     }
                     assert!(self.thread_for_run > 0);
-                    let target_tid = self.thread_for_run.try_into().unwrap();
+                    let target_tid: usize = self.thread_for_run.try_into().unwrap();
                     for (tid, thread) in env.threads.iter_mut().enumerate() {
                         if !thread.is_alive() {
                             continue;

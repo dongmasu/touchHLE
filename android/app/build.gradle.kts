@@ -80,9 +80,18 @@ android {
     kotlinOptions {
         jvmTarget = "11"
     }
+    signingConfigs {
+        create("localDebug") {
+            // Reuse the local debug key without AGP's default-key auto-creation check.
+            storeFile = file("${System.getProperty("user.home")}/.android/debug.keystore")
+            storePassword = "android"
+            keyAlias = "AndroidDebugKey"
+            keyPassword = "android"
+        }
+    }
     buildTypes {
         release {
-            signingConfig = signingConfigs.getByName("debug")
+            signingConfig = signingConfigs.getByName("localDebug")
             isMinifyEnabled = false
             isDebuggable = true // allow use of ADB to manage files, etc
         }
@@ -175,7 +184,10 @@ cargoNdk {
 }
 
 dependencies {
+    implementation("androidx.work:work-runtime:2.7.1")
+    implementation("com.google.android.gms:play-services-auth:20.7.0")
     implementation(fileTree("libs") {
         include("*.jar")
     })
+    testImplementation("junit:junit:4.13.2")
 }

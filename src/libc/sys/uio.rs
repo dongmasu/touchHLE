@@ -34,7 +34,8 @@ fn writev(
         let len = next.iov_len;
         let written = write(env, fd, next.iov_base.cast_const(), len);
         assert!(written >= 0); // TODO
-        assert_eq!(written, len.try_into().unwrap()); // TODO
+        let expected_written: GuestISize = len.try_into().unwrap();
+        assert_eq!(written, expected_written); // TODO
         res += written;
     }
     res

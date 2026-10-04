@@ -337,6 +337,31 @@ fn handle_touches_down(env: &mut Environment, map: HashMap<FingerId, Coords>) {
     release(env, pool);
 }
 
+fn take_attached_touch_view(env: &mut Environment, touch: id) -> id {
+    let (view, window) = {
+        let touch = env.objc.borrow::<UITouchHostObject>(touch);
+        (touch.view, touch.window)
+    };
+    let attached = if view == nil || window == nil {
+        false
+    } else if view == window {
+        true
+    } else {
+        let attached_window: id = msg![env; view window];
+        attached_window == window
+    };
+    if !attached {
+        if view != nil {
+            log!("Dropping touch callback for detached view {:?}", view);
+            env.objc.borrow_mut::<UITouchHostObject>(touch).view = nil;
+            release(env, view);
+        }
+        nil
+    } else {
+        view
+    }
+}
+
 fn handle_touches_move(env: &mut Environment, map: HashMap<FingerId, Coords>) {
     let pool: id = msg_class![env; NSAutoreleasePool new];
 
@@ -370,7 +395,7 @@ fn handle_touches_move(env: &mut Environment, map: HashMap<FingerId, Coords>) {
             y: coords.1,
         };
 
-        let view = env.objc.borrow::<UITouchHostObject>(touch).view;
+        let view = take_attached_touch_view(env, touch);
         let host_object = env.objc.borrow_mut::<UITouchHostObject>(touch);
 
         let pinch_touch = matches!(finger_id, FingerId::PinchAnchor | FingerId::PinchActive);
@@ -388,6 +413,9 @@ fn handle_touches_move(env: &mut Environment, map: HashMap<FingerId, Coords>) {
 
         let _: () = msg![env; touches addObject:touch];
 
+        if view == nil {
+            continue;
+        }
         if let Entry::Vacant(e) = view_touches.entry(view) {
             let touches: id = msg_class![env; NSMutableSet allocWithZone:(MutVoidPtr::null())];
             e.insert(touches);
@@ -473,7 +501,7 @@ fn handle_touches_up(env: &mut Environment, map: HashMap<FingerId, Coords>) {
             y: coords.1,
         };
 
-        let view = env.objc.borrow::<UITouchHostObject>(touch).view;
+        let view = take_attached_touch_view(env, touch);
         let (was_tap, tap_count) = {
             let host_object = env.objc.borrow_mut::<UITouchHostObject>(touch);
             let was_tap = host_object.phase == UITouchPhaseStationary;
@@ -502,12 +530,14 @@ fn handle_touches_up(env: &mut Environment, map: HashMap<FingerId, Coords>) {
 
         let _: () = msg![env; touches addObject:touch];
 
-        if let Entry::Vacant(e) = view_touches.entry(view) {
-            let touches: id = msg_class![env; NSMutableSet allocWithZone:(MutVoidPtr::null())];
-            e.insert(touches);
+        if view != nil {
+            if let Entry::Vacant(e) = view_touches.entry(view) {
+                let touches: id = msg_class![env; NSMutableSet allocWithZone:(MutVoidPtr::null())];
+                e.insert(touches);
+            }
+            let touches: id = *view_touches.get(&view).unwrap();
+            let _: () = msg![env; touches addObject:touch];
         }
-        let touches: id = *view_touches.get(&view).unwrap();
-        let _: () = msg![env; touches addObject:touch];
 
         let _ = &env
             .framework_state

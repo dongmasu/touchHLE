@@ -2,6 +2,7 @@
 # License, v. 2.0. If a copy of the MPL was not distributed with this
 # file, You can obtain one at https://mozilla.org/MPL/2.0/.
 [workspace]
+exclude = ["vendor/android-native-keyring-store"]
 
 [workspace.package]
 version = "0.2.3"
@@ -38,6 +39,8 @@ cmake = "0.1.49"
 gl_generator = "0.14.0"
 
 [dependencies]
+cap-std = "4.0.3"
+cap-fs-ext = "4.0.3"
 hound = "3.5.0"
 mach_object = "0.1.17"
 plist = "1.8.0"
@@ -61,6 +64,10 @@ quick-xml = "0.38.4"
 digest = "0.10.7"
 md-5 = "0.10.6"
 sha1 = "0.10.6"
+sha2 = "0.10.6"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+unicode-casefold = "0.2"
 encoding_rs = "0.8.35"
 # We currently use a fork of rust-sdl2 because we need a fix for Android builds
 # that's not upstream yet.
@@ -80,7 +87,29 @@ windows-sys = { version = "0.61.0", features = ["Win32_System_Memory"] }
 nibarchive = "0.1.0"
 libc = "0.2.180"
 corosensei = "0.3.2"
-uuid = { version = "1.2.2", default-features = false, features = ["v4"] }
+chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
+uuid = { version = "1.2.2", default-features = false, features = ["v4", "serde"] }
+keyring = { version = "4.2.0", default-features = false, features = ["v1"] }
+oauth2 = { version = "5.0.0", default-features = false, features = [
+    "reqwest-blocking",
+    "rustls-tls",
+] }
+url = "2.5.8"
+http = "1"
+reqwest = { version = "0.12.28", default-features = false, features = [
+    "blocking",
+    "json",
+    "rustls-tls",
+] }
+notify = "8"
+
+[target.'cfg(target_os = "android")'.dependencies]
+android-native-keyring-store = "1.0.0"
+jni = "0.21"
+keyring-core = "1.0.0"
+
+[patch.crates-io]
+android-native-keyring-store = { path = "vendor/android-native-keyring-store" }
 
 [build-dependencies]
 cargo-license = "0.5.1"

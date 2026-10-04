@@ -319,7 +319,7 @@ fn exit(env: &mut Environment, exit_code: i32) {
     set_errno(env, 0);
 
     echo!("App called exit(), exiting.");
-    std::process::exit(exit_code);
+    env.request_exit(exit_code);
 }
 
 fn bsearch(

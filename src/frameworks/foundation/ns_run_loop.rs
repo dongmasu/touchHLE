@@ -348,6 +348,10 @@ pub fn run_run_loop(
         // We want to process those only on the main run loop
         if is_main_run_loop {
             let next_due = uikit::handle_events(env);
+            if should_return_after_handling_events(env.exit_requested()) {
+                log!("Application exit requested; returning from the main run loop.");
+                return;
+            }
             limit_sleep_time(&mut sleep_until, next_due);
 
             let next_due = core_animation::recomposite_if_necessary(env, false);
@@ -477,6 +481,21 @@ pub fn run_run_loop(
                 break;
             }
         }
+    }
+}
+
+fn should_return_after_handling_events(exit_requested: bool) -> bool {
+    exit_requested
+}
+
+#[cfg(test)]
+mod shutdown_tests {
+    use super::should_return_after_handling_events;
+
+    #[test]
+    fn run_loop_returns_after_handling_events_when_exit_was_requested() {
+        assert!(!should_return_after_handling_events(false));
+        assert!(should_return_after_handling_events(true));
     }
 }
 

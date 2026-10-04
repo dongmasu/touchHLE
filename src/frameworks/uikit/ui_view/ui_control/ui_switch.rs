@@ -29,7 +29,7 @@ const THUMB_INSET: f32 = 1.0;
 const CORNER_RADIUS: f32 = 5.0;
 const THUMB_WIDTH: f32 = 42.0;
 // Those correspond to debugDescription output of UISwitch
-const TOTAL_WIDTH: f32 = 94.0;
+pub const TOTAL_WIDTH: f32 = 94.0;
 const TOTAL_HEIGHT: f32 = 27.0;
 
 pub struct UISwitchHostObject {
