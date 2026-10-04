@@ -3,6 +3,9 @@ $ErrorActionPreference = 'Stop'
 if ([string]::IsNullOrWhiteSpace($env:TOUCHHLE_GOOGLE_DESKTOP_OAUTH_CLIENT_ID)) {
     throw 'Set TOUCHHLE_GOOGLE_DESKTOP_OAUTH_CLIENT_ID in the environment before building.'
 }
+if ([string]::IsNullOrWhiteSpace($env:TOUCHHLE_GOOGLE_DESKTOP_OAUTH_CLIENT_SECRET)) {
+    throw 'Set TOUCHHLE_GOOGLE_DESKTOP_OAUTH_CLIENT_SECRET in the environment before building.'
+}
 
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $previousPolicyMinimum = [Environment]::GetEnvironmentVariable(

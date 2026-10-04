@@ -7,34 +7,27 @@ named `touchHLE`.
 
 ## Build Configuration
 
-Desktop builds need a Google OAuth client ID. It is public application
-metadata, not a client secret. Do not add refresh tokens, access tokens, or
-client secrets to the source tree.
+Desktop builds require `TOUCHHLE_GOOGLE_DESKTOP_OAUTH_CLIENT_ID` and
+`TOUCHHLE_GOOGLE_DESKTOP_OAUTH_CLIENT_SECRET` in the build environment.
 
-If your desktop OAuth client requires a client secret, set
-`TOUCHHLE_GOOGLE_DESKTOP_OAUTH_CLIENT_SECRET` in the runtime environment. For
-zsh, keep the value in your local `~/.zshrc` and launch touchHLE from a shell
-that has loaded it:
+The desktop build scripts require both values and compile them into the
+application. The running app does not require either environment variable,
+including when exchanging or refreshing tokens. Do not commit the client
+secret or share it as a standalone value. Because the application needs it,
+the compiled binary contains the client secret and it can be extracted from
+that binary.
 
-```sh
-export TOUCHHLE_GOOGLE_DESKTOP_OAUTH_CLIENT_SECRET="your-local-secret"
-```
-
-The app reads it when exchanging or refreshing tokens; the value is not
-compiled into the binary or written to logs. Never share the value or commit
-it to the source tree. It is optional for clients that do not use a secret.
-
-For desktop builds, set the build-time variable and run the script for your
-host platform:
+Run the script for your host platform:
 
 ```sh
 ./dev-scripts/build-desktop.sh
 ```
 
 On Windows, run `dev-scripts/build-desktop.ps1` from PowerShell. Both scripts
-require `TOUCHHLE_GOOGLE_DESKTOP_OAUTH_CLIENT_ID` to already be exported in
-the environment, apply the CMake 3.5 policy compatibility setting for the
-build, and create a native release binary under `target/release`.
+require `TOUCHHLE_GOOGLE_DESKTOP_OAUTH_CLIENT_ID` and
+`TOUCHHLE_GOOGLE_DESKTOP_OAUTH_CLIENT_SECRET` in the build environment, apply
+the CMake 3.5 policy compatibility setting, and create a native release
+binary under `target/release`.
 
 Android uses Google Identity Services' `AuthorizationClient`; it does not
 embed an OAuth client ID or use a browser redirect. In Google Cloud, create an

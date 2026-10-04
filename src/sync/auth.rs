@@ -199,10 +199,10 @@ pub fn configured_client_id() -> Option<&'static str> {
 }
 
 #[cfg(not(target_os = "android"))]
-pub fn configured_client_secret() -> Option<String> {
-    std::env::var("TOUCHHLE_GOOGLE_DESKTOP_OAUTH_CLIENT_SECRET")
-        .ok()
-        .filter(|client_secret| !client_secret.trim().is_empty())
+pub fn configured_client_secret() -> Option<&'static str> {
+    option_env!("TOUCHHLE_GOOGLE_DESKTOP_OAUTH_CLIENT_SECRET")
+        .map(str::trim)
+        .filter(|client_secret| !client_secret.is_empty())
 }
 
 pub fn authorization_available() -> bool {
@@ -212,7 +212,7 @@ pub fn authorization_available() -> bool {
     }
     #[cfg(not(target_os = "android"))]
     {
-        configured_client_id().is_some()
+        configured_client_id().is_some() && configured_client_secret().is_some()
     }
 }
 
@@ -221,7 +221,11 @@ pub fn start_authorization(
     client_id: String,
     open_browser: impl FnOnce(&str) -> Result<(), String>,
 ) -> Result<PendingAuthorization, AuthError> {
-    desktop::start_authorization(client_id, configured_client_secret(), open_browser)
+    desktop::start_authorization(
+        client_id,
+        configured_client_secret().map(str::to_owned),
+        open_browser,
+    )
 }
 
 #[cfg(target_os = "android")]
@@ -469,7 +473,7 @@ impl<S: TokenStore> AccessTokenProvider<S> {
                             .map_err(|_| AuthError::OAuth("invalid token endpoint".into()))?,
                     );
             let client = if let Some(client_secret) = configured_client_secret() {
-                client.set_client_secret(oauth2::ClientSecret::new(client_secret))
+                client.set_client_secret(oauth2::ClientSecret::new(client_secret.to_owned()))
             } else {
                 client
             };
