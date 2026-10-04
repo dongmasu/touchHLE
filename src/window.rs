@@ -18,7 +18,7 @@ use crate::image::Image;
 use crate::matrix::Matrix;
 use crate::options::Options;
 use crate::Environment;
-use sdl2::mouse::MouseButton;
+use sdl2::mouse::{MouseButton, MouseWheelDirection};
 use sdl2::pixels::PixelFormatEnum;
 use sdl2::surface::Surface;
 use sdl2_sys::SDL_PowerState;
@@ -28,6 +28,8 @@ use std::f32::consts::{FRAC_PI_2, PI};
 use std::num::NonZeroU32;
 use std::ptr::null_mut;
 use std::time::{Duration, Instant};
+
+const WHEEL_PINCH_IDLE_TIMEOUT: Duration = Duration::from_millis(180);
 
 #[allow(non_camel_case_types)]
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
@@ -130,11 +132,52 @@ fn pinch_distance(center: Coords, point: Coords, axis: Coords, max_distance: f32
     ((point.0 - center.0) * axis.0 + (point.1 - center.1) * axis.1).clamp(0.0, max_distance)
 }
 
+fn wheel_pinch_distance(
+    current_distance: f32,
+    scroll_y: f32,
+    distance_per_scroll_unit: f32,
+    max_distance: f32,
+) -> f32 {
+    (current_distance - scroll_y * distance_per_scroll_unit).clamp(0.0, max_distance)
+}
+
+fn recenter_pinch_points(center: Coords, first: Coords, second: Coords) -> (Coords, Coords) {
+    let midpoint = ((first.0 + second.0) / 2.0, (first.1 + second.1) / 2.0);
+    (
+        (
+            center.0 + first.0 - midpoint.0,
+            center.1 + first.1 - midpoint.1,
+        ),
+        (
+            center.0 + second.0 - midpoint.0,
+            center.1 + second.1 - midpoint.1,
+        ),
+    )
+}
+
+fn is_indirect_touch_device(touch_id: i64) -> bool {
+    unsafe {
+        matches!(
+            sdl2_sys::SDL_GetTouchDeviceType(touch_id),
+            sdl2_sys::SDL_TouchDeviceType::SDL_TOUCH_DEVICE_INDIRECT_ABSOLUTE
+                | sdl2_sys::SDL_TouchDeviceType::SDL_TOUCH_DEVICE_INDIRECT_RELATIVE
+        )
+    }
+}
+
+fn symmetric_pinch_points(center: Coords, axis: Coords, distance: f32) -> (Coords, Coords) {
+    let offset = (axis.0 * distance, axis.1 * distance);
+    (
+        (center.0 + offset.0, center.1 + offset.1),
+        (center.0 - offset.0, center.1 - offset.1),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        mirrored_pinch_point, pinch_axis, pinch_distance, preserve_window_size_on_rotation, Coords,
-        DeviceOrientation,
+        mirrored_pinch_point, pinch_axis, pinch_distance, preserve_window_size_on_rotation,
+        recenter_pinch_points, wheel_pinch_distance, Coords, DeviceOrientation,
     };
 
     #[test]
@@ -191,6 +234,28 @@ mod tests {
         assert!((pinch_distance(center, (100.0, 140.0), axis, 300.0) - 300.0).abs() < 0.001);
         assert_eq!(pinch_distance(center, (600.0, 200.0), axis, 300.0), 0.0);
     }
+
+    #[test]
+    fn wheel_scroll_changes_pinch_distance_in_opposite_directions() {
+        assert_eq!(wheel_pinch_distance(100.0, 1.0, 10.0, 200.0), 90.0);
+        assert_eq!(wheel_pinch_distance(100.0, -1.0, 10.0, 200.0), 110.0);
+    }
+
+    #[test]
+    fn wheel_pinch_distance_stays_within_viewport_limits() {
+        assert_eq!(wheel_pinch_distance(5.0, 1.0, 10.0, 200.0), 0.0);
+        assert_eq!(wheel_pinch_distance(195.0, -1.0, 10.0, 200.0), 200.0);
+    }
+
+    #[test]
+    fn recenter_pinch_points_removes_translation_without_changing_separation() {
+        let center = (50.0, 70.0);
+        let first = recenter_pinch_points(center, (10.0, 20.0), (30.0, 20.0));
+        let translated = recenter_pinch_points(center, (110.0, 220.0), (130.0, 220.0));
+
+        assert_eq!(first, ((40.0, 70.0), (60.0, 70.0)));
+        assert_eq!(translated, first);
+    }
 }
 
 fn rotate_fullscreen_size(orientation: DeviceOrientation, screen_size: (u32, u32)) -> (u32, u32) {
@@ -246,6 +311,13 @@ struct PinchState {
     max_distance: f32,
     first: Coords,
     second: Coords,
+}
+
+struct IndirectPinchState {
+    touch_id: i64,
+    first_finger_id: i64,
+    second_finger_id: i64,
+    points: (Coords, Coords),
 }
 
 struct DpadState {
@@ -362,6 +434,11 @@ pub struct Window {
     pinch_modifier_down: bool,
     pinch_mouse_button_active: bool,
     pinch_state: Option<PinchState>,
+    indirect_touch_fingers: HashMap<i64, Vec<i64>>,
+    indirect_touch_points: HashMap<(i64, i64), Coords>,
+    indirect_pinch_state: Option<IndirectPinchState>,
+    wheel_pinch_state: Option<PinchState>,
+    wheel_pinch_last_event: Option<Instant>,
     rotation_modifier_down: bool,
     /// Whether or not we are on the "main" environment stack (rather than
     /// a coroutine stack). Checked in various functions to make sure that
@@ -383,6 +460,9 @@ impl Window {
         launch_image: Option<Image>,
         options: &Options,
     ) -> Window {
+        #[cfg(target_os = "macos")]
+        // Let SDL expose MacBook trackpad contacts through the touch event path.
+        sdl2::hint::set("SDL_TRACKPAD_IS_TOUCH_ONLY", "1");
         let sdl_ctx = sdl2::init().unwrap();
         let video_ctx = sdl_ctx.video().unwrap();
 
@@ -525,6 +605,11 @@ impl Window {
             pinch_modifier_down: false,
             pinch_mouse_button_active: false,
             pinch_state: None,
+            indirect_touch_fingers: HashMap::new(),
+            indirect_touch_points: HashMap::new(),
+            indirect_pinch_state: None,
+            wheel_pinch_state: None,
+            wheel_pinch_last_event: None,
             rotation_modifier_down: false,
             on_main_stack: true,
         };
@@ -631,6 +716,18 @@ impl Window {
                 ),
             ])
         };
+        let pinch_map_for_points = |window: &Window, (anchor, active): (Coords, Coords)| {
+            HashMap::from([
+                (
+                    FingerId::PinchAnchor,
+                    transform_input_coords(window, anchor, false),
+                ),
+                (
+                    FingerId::PinchActive,
+                    transform_input_coords(window, active, false),
+                ),
+            ])
+        };
 
         let mut controller_updated = false;
         // event_pump doesn't have a method to peek on events
@@ -720,7 +817,14 @@ impl Window {
                     ..
                 } => {
                     self.pinch_modifier_down = true;
-                    if self.event_pump.mouse_state().left() && self.pinch_state.is_none() {
+                    if self.event_pump.mouse_state().left()
+                        && self.pinch_state.is_none()
+                        && self.indirect_pinch_state.is_none()
+                    {
+                        if let Some(points) = self.end_wheel_pinch() {
+                            self.event_queue
+                                .push_back(Event::TouchesUp(pinch_map_for_points(self, points)));
+                        }
                         let mouse_state = self.event_pump.mouse_state();
                         self.start_pinch(mouse_state.x() as f32, mouse_state.y() as f32);
                         self.event_queue
@@ -746,6 +850,62 @@ impl Window {
 
             let touch_event = match event {
                 E::Quit { .. } => Event::Quit,
+                E::MouseWheel {
+                    y,
+                    precise_y,
+                    direction,
+                    ..
+                } => {
+                    if self.pinch_state.is_some() || self.indirect_pinch_state.is_some() {
+                        continue;
+                    }
+
+                    let mut scroll_y = if precise_y.abs() > f32::EPSILON {
+                        precise_y
+                    } else {
+                        y as f32
+                    };
+                    if direction == MouseWheelDirection::Flipped {
+                        scroll_y = -scroll_y;
+                    }
+                    if !scroll_y.is_finite() || scroll_y.abs() <= f32::EPSILON {
+                        continue;
+                    }
+
+                    if self.wheel_pinch_state.is_none() {
+                        self.start_wheel_pinch();
+                        self.event_queue
+                            .push_back(Event::TouchesDown(pinch_map(self)));
+                    }
+
+                    let (_, _, _, viewport_height) = self.viewport();
+                    let distance_per_scroll_unit = viewport_height as f32 * 0.03;
+                    {
+                        let state = self.wheel_pinch_state.as_mut().unwrap();
+                        let current_distance = pinch_distance(
+                            state.center,
+                            state.first,
+                            state.axis,
+                            state.max_distance,
+                        );
+                        let distance = wheel_pinch_distance(
+                            current_distance,
+                            scroll_y,
+                            distance_per_scroll_unit,
+                            state.max_distance,
+                        );
+                        state.first = (
+                            state.center.0 + state.axis.0 * distance,
+                            state.center.1 + state.axis.1 * distance,
+                        );
+                        state.second = mirrored_pinch_point(state.center, state.first);
+                    }
+                    self.wheel_pinch_last_event = Some(Instant::now());
+                    log_dbg!("MouseWheel mapped to pinch, scroll_y {}", scroll_y);
+                    self.event_queue
+                        .push_back(Event::TouchesMove(pinch_map(self)));
+                    continue;
+                }
                 E::KeyDown {
                     keycode,
                     scancode,
@@ -772,7 +932,11 @@ impl Window {
                     mouse_btn: MouseButton::Left,
                     ..
                 } if self.pinch_modifier_down => {
-                    if self.pinch_state.is_none() {
+                    if self.pinch_state.is_none() && self.indirect_pinch_state.is_none() {
+                        if let Some(points) = self.end_wheel_pinch() {
+                            self.event_queue
+                                .push_back(Event::TouchesUp(pinch_map_for_points(self, points)));
+                        }
                         self.start_pinch(x as f32, y as f32);
                         self.event_queue
                             .push_back(Event::TouchesDown(pinch_map(self)));
@@ -987,8 +1151,71 @@ impl Window {
                     self.enable_event_polling = false;
                     continue;
                 }
+                E::FingerDown {
+                    touch_id,
+                    finger_id,
+                    x,
+                    y,
+                    ..
+                } if is_indirect_touch_device(touch_id) => {
+                    let coords = finger_absolute_coords(self, (x, y));
+                    let fingers = self.indirect_touch_fingers.entry(touch_id).or_default();
+                    if !fingers.contains(&finger_id) {
+                        fingers.push(finger_id);
+                    }
+                    self.indirect_touch_points
+                        .insert((touch_id, finger_id), coords);
+                    if self.indirect_pinch_state.is_none()
+                        && self.indirect_touch_fingers[&touch_id].len() >= 2
+                    {
+                        if let Some(points) = self.end_wheel_pinch() {
+                            self.event_queue
+                                .push_back(Event::TouchesUp(pinch_map_for_points(self, points)));
+                        }
+                    }
+                    if let Some(points) = self.start_indirect_pinch(touch_id) {
+                        self.event_queue
+                            .push_back(Event::TouchesDown(pinch_map_for_points(self, points)));
+                    }
+                    continue;
+                }
+                E::FingerMotion {
+                    touch_id,
+                    finger_id,
+                    x,
+                    y,
+                    ..
+                } if is_indirect_touch_device(touch_id) => {
+                    let coords = finger_absolute_coords(self, (x, y));
+                    if let Some(points) = self.update_indirect_pinch(touch_id, finger_id, coords) {
+                        self.event_queue
+                            .push_back(Event::TouchesMove(pinch_map_for_points(self, points)));
+                    }
+                    continue;
+                }
+                E::FingerUp {
+                    touch_id,
+                    finger_id,
+                    x,
+                    y,
+                    ..
+                } if is_indirect_touch_device(touch_id) => {
+                    let coords = finger_absolute_coords(self, (x, y));
+                    let _ = self.update_indirect_pinch(touch_id, finger_id, coords);
+                    if let Some(points) = self.end_indirect_pinch_for_finger(touch_id, finger_id) {
+                        self.event_queue
+                            .push_back(Event::TouchesUp(pinch_map_for_points(self, points)));
+                    }
+                    self.remove_indirect_touch_finger(touch_id, finger_id);
+                    if let Some(points) = self.start_indirect_pinch(touch_id) {
+                        self.event_queue
+                            .push_back(Event::TouchesDown(pinch_map_for_points(self, points)));
+                    }
+                    continue;
+                }
                 E::FingerUp {
                     timestamp,
+                    touch_id,
                     finger_id,
                     x,
                     y,
@@ -996,6 +1223,7 @@ impl Window {
                 }
                 | E::FingerMotion {
                     timestamp,
+                    touch_id,
                     finger_id,
                     x,
                     y,
@@ -1003,6 +1231,7 @@ impl Window {
                 }
                 | E::FingerDown {
                     timestamp,
+                    touch_id,
                     finger_id,
                     x,
                     y,
@@ -1015,6 +1244,7 @@ impl Window {
                     // (in worst case we separate multi-touches in several ones)
                     // TODO: handle out of order touches
                     let curr_timestamp = timestamp;
+                    let curr_touch_id = touch_id;
                     let abs_coords = finger_absolute_coords(self, (x, y));
                     let coords = transform_input_coords(self, abs_coords, false);
                     log_dbg!("Finger event x {}, y {}, coords {:?}", x, y, coords);
@@ -1027,6 +1257,7 @@ impl Window {
                         match next {
                             E::FingerUp {
                                 timestamp,
+                                touch_id,
                                 finger_id,
                                 x,
                                 y,
@@ -1034,6 +1265,7 @@ impl Window {
                             }
                             | E::FingerMotion {
                                 timestamp,
+                                touch_id,
                                 finger_id,
                                 x,
                                 y,
@@ -1041,16 +1273,24 @@ impl Window {
                             }
                             | E::FingerDown {
                                 timestamp,
+                                touch_id,
                                 finger_id,
                                 x,
                                 y,
                                 ..
-                            } if timestamp == curr_timestamp && next.is_same_kind_as(&event) => {
+                            } if timestamp == curr_timestamp
+                                && touch_id == curr_touch_id
+                                && next.is_same_kind_as(&event) =>
+                            {
                                 let abs_coords = finger_absolute_coords(self, (x, y));
                                 let coords = transform_input_coords(self, abs_coords, false);
                                 map.insert(FingerId::Touch(finger_id), coords);
                             }
-                            E::MultiGesture { timestamp, .. } if timestamp == curr_timestamp => {
+                            E::MultiGesture {
+                                timestamp,
+                                touch_id,
+                                ..
+                            } if timestamp == curr_timestamp && touch_id == curr_touch_id => {
                                 // TODO: handle gestures
                                 continue;
                             }
@@ -1102,6 +1342,15 @@ impl Window {
                 _ => continue,
             };
             self.event_queue.push_back(touch_event);
+        }
+
+        if self.wheel_pinch_last_event.is_some_and(|last_event| {
+            Instant::now().saturating_duration_since(last_event) >= WHEEL_PINCH_IDLE_TIMEOUT
+        }) {
+            if let Some(points) = self.end_wheel_pinch() {
+                self.event_queue
+                    .push_back(Event::TouchesUp(pinch_map_for_points(self, points)));
+            }
         }
 
         if controller_updated {
@@ -1276,11 +1525,135 @@ impl Window {
     }
 
     pub fn pinch_visible_at(&self) -> Option<(Coords, Coords)> {
-        self.pinch_points()
+        self.pinch_state
+            .as_ref()
+            .map(|state| (state.first, state.second))
     }
 
     fn pinch_points(&self) -> Option<(Coords, Coords)> {
-        let state = self.pinch_state.as_ref()?;
+        self.pinch_state
+            .as_ref()
+            .map(|state| (state.first, state.second))
+            .or_else(|| self.indirect_pinch_state.as_ref().map(|state| state.points))
+            .or_else(|| {
+                self.wheel_pinch_state
+                    .as_ref()
+                    .map(|state| (state.first, state.second))
+            })
+    }
+
+    fn start_indirect_pinch(&mut self, touch_id: i64) -> Option<(Coords, Coords)> {
+        if self.indirect_pinch_state.is_some() || self.pinch_state.is_some() {
+            return None;
+        }
+
+        let fingers = self.indirect_touch_fingers.get(&touch_id)?;
+        let (&first_finger_id, &second_finger_id) = (fingers.first()?, fingers.get(1)?);
+        let first = *self
+            .indirect_touch_points
+            .get(&(touch_id, first_finger_id))?;
+        let second = *self
+            .indirect_touch_points
+            .get(&(touch_id, second_finger_id))?;
+        let (viewport_x, viewport_y, viewport_width, viewport_height) = self.viewport();
+        let center = (
+            viewport_x as f32 + viewport_width as f32 / 2.0,
+            viewport_y as f32 + viewport_height as f32 / 2.0,
+        );
+        let points = recenter_pinch_points(center, first, second);
+        self.indirect_pinch_state = Some(IndirectPinchState {
+            touch_id,
+            first_finger_id,
+            second_finger_id,
+            points,
+        });
+        Some(points)
+    }
+
+    fn update_indirect_pinch(
+        &mut self,
+        touch_id: i64,
+        finger_id: i64,
+        coords: Coords,
+    ) -> Option<(Coords, Coords)> {
+        if !self
+            .indirect_touch_fingers
+            .get(&touch_id)
+            .is_some_and(|fingers| fingers.contains(&finger_id))
+        {
+            return None;
+        }
+        self.indirect_touch_points
+            .insert((touch_id, finger_id), coords);
+
+        let (viewport_x, viewport_y, viewport_width, viewport_height) = self.viewport();
+        let center = (
+            viewport_x as f32 + viewport_width as f32 / 2.0,
+            viewport_y as f32 + viewport_height as f32 / 2.0,
+        );
+        let state = self.indirect_pinch_state.as_mut()?;
+        if state.touch_id != touch_id
+            || (state.first_finger_id != finger_id && state.second_finger_id != finger_id)
+        {
+            return None;
+        }
+
+        let first = *self
+            .indirect_touch_points
+            .get(&(touch_id, state.first_finger_id))?;
+        let second = *self
+            .indirect_touch_points
+            .get(&(touch_id, state.second_finger_id))?;
+        state.points = recenter_pinch_points(center, first, second);
+        Some(state.points)
+    }
+
+    fn end_indirect_pinch_for_finger(
+        &mut self,
+        touch_id: i64,
+        finger_id: i64,
+    ) -> Option<(Coords, Coords)> {
+        let state = self.indirect_pinch_state.as_ref()?;
+        if state.touch_id != touch_id
+            || (state.first_finger_id != finger_id && state.second_finger_id != finger_id)
+        {
+            return None;
+        }
+        self.indirect_pinch_state.take().map(|state| state.points)
+    }
+
+    fn remove_indirect_touch_finger(&mut self, touch_id: i64, finger_id: i64) {
+        self.indirect_touch_points.remove(&(touch_id, finger_id));
+        if let Some(fingers) = self.indirect_touch_fingers.get_mut(&touch_id) {
+            fingers.retain(|active_finger_id| *active_finger_id != finger_id);
+            if fingers.is_empty() {
+                self.indirect_touch_fingers.remove(&touch_id);
+            }
+        }
+    }
+
+    fn start_wheel_pinch(&mut self) {
+        let (viewport_x, viewport_y, viewport_width, viewport_height) = self.viewport();
+        let center = (
+            viewport_x as f32 + viewport_width as f32 / 2.0,
+            viewport_y as f32 + viewport_height as f32 / 2.0,
+        );
+        let axis = (1.0, 0.0);
+        let max_distance = viewport_width as f32 / 2.0;
+        let distance = max_distance * 0.35;
+        let (first, second) = symmetric_pinch_points(center, axis, distance);
+        self.wheel_pinch_state = Some(PinchState {
+            center,
+            axis,
+            max_distance,
+            first,
+            second,
+        });
+    }
+
+    fn end_wheel_pinch(&mut self) -> Option<(Coords, Coords)> {
+        let state = self.wheel_pinch_state.take()?;
+        self.wheel_pinch_last_event = None;
         Some((state.first, state.second))
     }
 
