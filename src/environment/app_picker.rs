@@ -35,7 +35,7 @@ use crate::options::Options;
 use crate::paths;
 use crate::sync::auth::{self, PendingAuthorization};
 use crate::sync::coordinator::{load_settings, save_settings, settings_path, SyncSettings};
-use crate::sync::live::{affects_apps, LiveEvent};
+use crate::sync::live::{affects_apps, LiveControl, LiveEvent};
 use crate::sync::model::{LocalOrRemote, SnapshotEntry, SyncError};
 use crate::sync::reconcile::{ConflictChoice, RemoteVersionId, SyncPlan};
 use crate::sync::status::{load_live_status, LiveStatus};
@@ -58,14 +58,24 @@ struct AppInfo {
     icon_ui_image: Option<id>,
 }
 
-pub fn app_picker(
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PickerSyncResult {
+    Completed,
+    Offline,
+}
+
+pub fn app_picker<F>(
     options: Options,
-    live_control: Option<crate::sync::live::LiveControl>,
-) -> Result<Option<(PathBuf, Vec<String>)>, String> {
+    live_control: Option<LiveControl>,
+    run_sync: F,
+) -> Result<Option<(PathBuf, Vec<String>)>, String>
+where
+    F: FnMut() -> Result<(Option<LiveControl>, Result<PickerSyncResult, String>), String> + 'static,
+{
     let sync_root = paths::user_data_base_path().to_path_buf();
     let apps_dir = sync_root.join(paths::APPS_DIR);
     let apps = refresh_apps(&apps_dir);
-    show_app_picker_gui(options, sync_root, apps, live_control)
+    show_app_picker_gui(options, sync_root, apps, live_control, run_sync)
 }
 
 fn refresh_apps(apps_dir: &Path) -> Result<Vec<AppInfo>, String> {
@@ -889,6 +899,15 @@ struct AppPickerDelegateHostObject {
 }
 impl HostObject for AppPickerDelegateHostObject {}
 
+fn take_picker_host_value<T>(
+    env: &mut Environment,
+    delegate: id,
+    take: impl FnOnce(&mut AppPickerDelegateHostObject) -> T,
+) -> T {
+    let mut host_obj = env.objc.borrow_mut::<AppPickerDelegateHostObject>(delegate);
+    take(&mut host_obj)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SyncResolverAction {
     PreviousFile,
@@ -1076,23 +1095,32 @@ const CLASSES: ClassExports = objc_classes! {
 
 };
 
-fn show_app_picker_gui(
+fn show_app_picker_gui<F>(
     options: Options,
     sync_root: PathBuf,
     apps: Result<Vec<AppInfo>, String>,
-    live_control: Option<crate::sync::live::LiveControl>,
-) -> Result<Option<(PathBuf, Vec<String>)>, String> {
+    live_control: Option<LiveControl>,
+    run_sync: F,
+) -> Result<Option<(PathBuf, Vec<String>)>, String>
+where
+    F: FnMut() -> Result<(Option<LiveControl>, Result<PickerSyncResult, String>), String> + 'static,
+{
     let icon = picker_icon();
     let environment = Environment::new_without_app(options, icon)?;
-    Ok(environment.run_app_picker(move |env| app_picker_inner(env, sync_root, apps, live_control)))
+    Ok(environment
+        .run_app_picker(move |env| app_picker_inner(env, sync_root, apps, live_control, run_sync)))
 }
 
-fn app_picker_inner(
+fn app_picker_inner<F>(
     env: &mut Environment,
     sync_root: PathBuf,
     initial_apps: Result<Vec<AppInfo>, String>,
-    live_control: Option<crate::sync::live::LiveControl>,
-) -> Option<(PathBuf, Vec<String>)> {
+    mut live_control: Option<LiveControl>,
+    mut run_sync: F,
+) -> Option<(PathBuf, Vec<String>)>
+where
+    F: FnMut() -> Result<(Option<LiveControl>, Result<PickerSyncResult, String>), String>,
+{
     let mut option_args = Vec::new();
     // Note that objects are generally not released in this code, because they
     // don't need to be: the entire Environment is thrown away at the end.
@@ -1453,6 +1481,7 @@ fn app_picker_inner(
     let mut sync_ui_changed = false;
     let mut refresh_debounce = PickerRefreshDebounce::default();
     let app_path = loop {
+        let mut request_sync = false;
         run_run_loop_single_iteration(env, main_run_loop);
         if env.exit_requested() {
             return None;
@@ -1606,6 +1635,10 @@ fn app_picker_inner(
                                     sync_settings = updated;
                                     sync_auth_status =
                                         "Google Drive connected. Sync enabled.".to_owned();
+                                    request_sync_if_enabled(
+                                        &mut request_sync,
+                                        sync_settings.enabled,
+                                    );
                                     if let Some(control) = &live_control {
                                         if let Err(error) =
                                             control.set_enabled(sync_settings.enabled)
@@ -1640,8 +1673,9 @@ fn app_picker_inner(
                 Ok(None) => {}
             }
         }
-        let host_obj = env.objc.borrow_mut::<AppPickerDelegateHostObject>(delegate);
-        let icon_tapped = std::mem::take(&mut host_obj.icon_tapped);
+        let icon_tapped = take_picker_host_value(env, delegate, |host_obj| {
+            std::mem::take(&mut host_obj.icon_tapped)
+        });
         if icon_tapped != nil {
             let tapped = picker_grid
                 .icon_grid
@@ -1684,14 +1718,20 @@ fn app_picker_inner(
             }
             continue;
         }
-        if std::mem::take(&mut host_obj.more_actions_toggle) {
+        if take_picker_host_value(env, delegate, |host_obj| {
+            std::mem::take(&mut host_obj.more_actions_toggle)
+        }) {
             more_actions_open = !more_actions_open;
             () = msg![env; (more_actions_stuff.main_view) setHidden:(!more_actions_open)];
             keep_more_actions_above_picker(env, main_view, &more_actions_stuff, more_actions_open);
-        } else if std::mem::take(&mut host_obj.more_actions_dismiss) {
+        } else if take_picker_host_value(env, delegate, |host_obj| {
+            std::mem::take(&mut host_obj.more_actions_dismiss)
+        }) {
             more_actions_open = false;
             () = msg![env; (more_actions_stuff.main_view) setHidden:true];
-        } else if std::mem::take(&mut host_obj.sync_settings_show) {
+        } else if take_picker_host_value(env, delegate, |host_obj| {
+            std::mem::take(&mut host_obj.sync_settings_show)
+        }) {
             live_status =
                 picker_live_status(&sync_root, live_control.is_some(), Some(&live_status));
             more_actions_open = false;
@@ -1713,15 +1753,20 @@ fn app_picker_inner(
                 sync_settings_open,
             );
             sync_ui_changed = true;
-        } else if std::mem::take(&mut host_obj.sync_settings_hide) {
+        } else if take_picker_host_value(env, delegate, |host_obj| {
+            std::mem::take(&mut host_obj.sync_settings_hide)
+        }) {
             () = msg![env; (sync_settings_stuff.main_view) setHidden:true];
             sync_settings_open = false;
-        } else if let Some(enabled) = std::mem::take(&mut host_obj.sync_toggle) {
+        } else if let Some(enabled) = take_picker_host_value(env, delegate, |host_obj| {
+            std::mem::take(&mut host_obj.sync_toggle)
+        }) {
             let updated = SyncSettings { enabled };
             match save_settings(&settings_file, &updated) {
                 Ok(()) => {
                     sync_settings = updated;
                     sync_auth_status.clear();
+                    request_sync_if_enabled(&mut request_sync, enabled);
                     if let Some(control) = &live_control {
                         if let Err(error) = control.set_enabled(sync_settings.enabled) {
                             sync_auth_status = crate::sync::status::redacted_error(&error);
@@ -1731,7 +1776,9 @@ fn app_picker_inner(
                 Err(error) => sync_auth_status = crate::sync::status::redacted_error(&error),
             }
             sync_ui_changed = true;
-        } else if std::mem::take(&mut host_obj.sync_connect) {
+        } else if take_picker_host_value(env, delegate, |host_obj| {
+            std::mem::take(&mut host_obj.sync_connect)
+        }) {
             match (
                 auth::authorization_available(),
                 pending_authorization.is_none(),
@@ -1761,7 +1808,9 @@ fn app_picker_inner(
                 }
             }
             sync_ui_changed = true;
-        } else if std::mem::take(&mut host_obj.copyright_show) {
+        } else if take_picker_host_value(env, delegate, |host_obj| {
+            std::mem::take(&mut host_obj.copyright_show)
+        }) {
             copyright_info_page_idx = 0;
             layout_copyright_info(
                 env,
@@ -1783,10 +1832,15 @@ fn app_picker_inner(
                 &copyright_info_stuff,
                 copyright_info_open,
             );
-        } else if std::mem::take(&mut host_obj.copyright_hide) {
+        } else if take_picker_host_value(env, delegate, |host_obj| {
+            std::mem::take(&mut host_obj.copyright_hide)
+        }) {
             () = msg![env; (copyright_info_stuff.main_view) setHidden:true];
             copyright_info_open = false;
-        } else if std::mem::take(&mut host_obj.copyright_prev) && copyright_info_page_idx != 0 {
+        } else if take_picker_host_value(env, delegate, |host_obj| {
+            std::mem::take(&mut host_obj.copyright_prev)
+        }) && copyright_info_page_idx != 0
+        {
             copyright_info_page_idx -= 1;
             change_copyright_page(
                 env,
@@ -1794,8 +1848,9 @@ fn app_picker_inner(
                 &copyright_info_text,
                 copyright_info_page_idx,
             );
-        } else if std::mem::take(&mut host_obj.copyright_next)
-            && Some(copyright_info_page_idx) != copyright_info_stuff.last_page_idx
+        } else if take_picker_host_value(env, delegate, |host_obj| {
+            std::mem::take(&mut host_obj.copyright_next)
+        }) && Some(copyright_info_page_idx) != copyright_info_stuff.last_page_idx
         {
             copyright_info_page_idx += 1;
             change_copyright_page(
@@ -1804,7 +1859,9 @@ fn app_picker_inner(
                 &copyright_info_text,
                 copyright_info_page_idx,
             );
-        } else if std::mem::take(&mut host_obj.quick_options_show) {
+        } else if take_picker_host_value(env, delegate, |host_obj| {
+            std::mem::take(&mut host_obj.quick_options_show)
+        }) {
             () = msg![env; (quick_options_stuff.main_view) setHidden:false];
             quick_options_open = true;
             layout_quick_options(
@@ -1819,81 +1876,169 @@ fn app_picker_inner(
                 &quick_options_stuff,
                 quick_options_open,
             );
-        } else if std::mem::take(&mut host_obj.quick_options_hide) {
+        } else if take_picker_host_value(env, delegate, |host_obj| {
+            std::mem::take(&mut host_obj.quick_options_hide)
+        }) {
             () = msg![env; (quick_options_stuff.main_view) setHidden:true];
             quick_options_open = false;
-        } else if std::mem::take(&mut host_obj.scale_hack_default) {
+        } else if take_picker_host_value(env, delegate, |host_obj| {
+            std::mem::take(&mut host_obj.scale_hack_default)
+        }) {
             quick_options_scale_hack = None;
             update_scale_hack_buttons(
                 env,
                 &quick_options_stuff.scale_hack_buttons,
                 quick_options_scale_hack,
             );
-        } else if std::mem::take(&mut host_obj.scale_hack1) {
+        } else if take_picker_host_value(env, delegate, |host_obj| {
+            std::mem::take(&mut host_obj.scale_hack1)
+        }) {
             quick_options_scale_hack = Some(NonZeroU32::new(1).unwrap());
             update_scale_hack_buttons(
                 env,
                 &quick_options_stuff.scale_hack_buttons,
                 quick_options_scale_hack,
             );
-        } else if std::mem::take(&mut host_obj.scale_hack2) {
+        } else if take_picker_host_value(env, delegate, |host_obj| {
+            std::mem::take(&mut host_obj.scale_hack2)
+        }) {
             quick_options_scale_hack = Some(NonZeroU32::new(2).unwrap());
             update_scale_hack_buttons(
                 env,
                 &quick_options_stuff.scale_hack_buttons,
                 quick_options_scale_hack,
             );
-        } else if std::mem::take(&mut host_obj.scale_hack3) {
+        } else if take_picker_host_value(env, delegate, |host_obj| {
+            std::mem::take(&mut host_obj.scale_hack3)
+        }) {
             quick_options_scale_hack = Some(NonZeroU32::new(3).unwrap());
             update_scale_hack_buttons(
                 env,
                 &quick_options_stuff.scale_hack_buttons,
                 quick_options_scale_hack,
             );
-        } else if std::mem::take(&mut host_obj.scale_hack4) {
+        } else if take_picker_host_value(env, delegate, |host_obj| {
+            std::mem::take(&mut host_obj.scale_hack4)
+        }) {
             quick_options_scale_hack = Some(NonZeroU32::new(4).unwrap());
             update_scale_hack_buttons(
                 env,
                 &quick_options_stuff.scale_hack_buttons,
                 quick_options_scale_hack,
             );
-        } else if std::mem::take(&mut host_obj.orientation_default) {
+        } else if take_picker_host_value(env, delegate, |host_obj| {
+            std::mem::take(&mut host_obj.orientation_default)
+        }) {
             quick_options_orientation = None;
             update_orientation_buttons(
                 env,
                 &quick_options_stuff.orientation_buttons,
                 quick_options_orientation,
             );
-        } else if std::mem::take(&mut host_obj.orientation_portrait_upside_down) {
+        } else if take_picker_host_value(env, delegate, |host_obj| {
+            std::mem::take(&mut host_obj.orientation_portrait_upside_down)
+        }) {
             quick_options_orientation = Some(DeviceOrientation::PortraitUpsideDown);
             update_orientation_buttons(
                 env,
                 &quick_options_stuff.orientation_buttons,
                 quick_options_orientation,
             );
-        } else if std::mem::take(&mut host_obj.orientation_landscape_left) {
+        } else if take_picker_host_value(env, delegate, |host_obj| {
+            std::mem::take(&mut host_obj.orientation_landscape_left)
+        }) {
             quick_options_orientation = Some(DeviceOrientation::LandscapeLeft);
             update_orientation_buttons(
                 env,
                 &quick_options_stuff.orientation_buttons,
                 quick_options_orientation,
             );
-        } else if std::mem::take(&mut host_obj.orientation_landscape_right) {
+        } else if take_picker_host_value(env, delegate, |host_obj| {
+            std::mem::take(&mut host_obj.orientation_landscape_right)
+        }) {
             quick_options_orientation = Some(DeviceOrientation::LandscapeRight);
             update_orientation_buttons(
                 env,
                 &quick_options_stuff.orientation_buttons,
                 quick_options_orientation,
             );
-        } else if let Some(enabled) = std::mem::take(&mut host_obj.analog_stick_tilt_controls) {
+        } else if let Some(enabled) = take_picker_host_value(env, delegate, |host_obj| {
+            std::mem::take(&mut host_obj.analog_stick_tilt_controls)
+        }) {
             quick_options_analog_stick_tilt_controls = enabled;
-        } else if let Some(enabled) = std::mem::take(&mut host_obj.network) {
+        } else if let Some(enabled) = take_picker_host_value(env, delegate, |host_obj| {
+            std::mem::take(&mut host_obj.network)
+        }) {
             quick_options_network = enabled;
-        } else if let Some(fullscreen) = std::mem::take(&mut host_obj.fullscreen) {
+        } else if let Some(fullscreen) = take_picker_host_value(env, delegate, |host_obj| {
+            std::mem::take(&mut host_obj.fullscreen)
+        }) {
             quick_options_fullscreen = match fullscreen {
                 false => None,
                 true => Some(()),
             };
+        }
+        if request_sync {
+            sync_auth_status = "Syncing with Google Drive...".to_owned();
+            update_cloud_sync_settings(
+                env,
+                &sync_settings_stuff,
+                &sync_settings,
+                &live_status,
+                sync_account_connected,
+                &sync_auth_status,
+            );
+            match run_sync() {
+                Ok((new_live_control, result)) => {
+                    live_control = new_live_control;
+                    sync_auth_status = match result {
+                        Ok(PickerSyncResult::Completed) => {
+                            "Google Drive sync completed.".to_owned()
+                        }
+                        Ok(PickerSyncResult::Offline) => {
+                            "Cloud sync unavailable; continuing with local files.".to_owned()
+                        }
+                        Err(error) => format!("Google Drive sync failed: {error}"),
+                    };
+                }
+                Err(error) => {
+                    live_control = None;
+                    sync_auth_status = format!("Google Drive sync failed: {error}");
+                }
+            }
+            live_status =
+                picker_live_status(&sync_root, live_control.is_some(), Some(&live_status));
+            refresh_picker_grid(
+                env,
+                delegate,
+                main_view,
+                app_frame,
+                divider,
+                have_wallpaper,
+                &mut picker_grid,
+                &mut apps,
+                refresh_apps(&apps_dir),
+            );
+            keep_more_actions_above_picker(env, main_view, &more_actions_stuff, more_actions_open);
+            keep_cloud_sync_settings_above_picker(
+                env,
+                main_view,
+                &sync_settings_stuff,
+                sync_settings_open,
+            );
+            keep_quick_options_above_picker(
+                env,
+                main_view,
+                &quick_options_stuff,
+                quick_options_open,
+            );
+            keep_copyright_info_above_picker(
+                env,
+                main_view,
+                &copyright_info_stuff,
+                copyright_info_open,
+            );
+            sync_ui_changed = true;
         }
         if sync_ui_changed {
             update_cloud_sync_settings(
@@ -2001,6 +2146,10 @@ impl PickerRefreshDebounce {
             false
         }
     }
+}
+
+fn request_sync_if_enabled(requested: &mut bool, enabled: bool) {
+    *requested |= enabled;
 }
 
 fn clamp_page_index(page_index: usize, page_count: usize) -> usize {
@@ -3696,6 +3845,15 @@ mod cloud_sync_ui_tests {
     use super::*;
     use crate::sync::status::LiveStatus;
     use chrono::TimeZone;
+
+    #[test]
+    fn enabling_cloud_sync_requests_an_immediate_sync() {
+        let mut requested = false;
+        request_sync_if_enabled(&mut requested, false);
+        assert!(!requested);
+        request_sync_if_enabled(&mut requested, true);
+        assert!(requested);
+    }
 
     #[test]
     fn status_redraw_preserves_and_clamps_scroll_instead_of_jumping_to_bottom() {

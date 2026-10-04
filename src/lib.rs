@@ -59,7 +59,9 @@ mod window;
 // via re-exports.
 use environment::{Environment, MutexId, MutexType, ThreadId, PTHREAD_MUTEX_DEFAULT};
 
+use std::cell::RefCell;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::time::Instant;
 
 pub use touchHLE_version::*;
@@ -229,22 +231,42 @@ pub fn main<T: Iterator<Item = String>>(mut args: T) -> Result<(), String> {
             )
         })?;
     let picker_was_used = bundle_path.is_none();
-
+    let mut picker_sync_attempted = false;
     let bundle_path = if let Some(bundle_path) = bundle_path {
         bundle_path
     } else {
-        let mut options = options::Options::default();
+        let mut picker_options = options::Options::default();
         // Apply command-line options only (no app-specific options apply)
         for option_arg in &option_args {
-            let parse_result = options.parse_argument(option_arg);
+            let parse_result = picker_options.parse_argument(option_arg);
             assert!(parse_result == Ok(true));
         }
         echo!(
             "No app specified, opening app picker. Use the --help flag to see command-line usage."
         );
-        let Some((bundle_path, mut extra_options)) =
-            environment::app_picker::app_picker(options, live_control.take())?
-        else {
+
+        let sync_context = Rc::new(RefCell::new(PickerSyncContext {
+            coordinator: sync_coordinator.take(),
+            guest_session: guest_session.take(),
+            sync_root: sync_root.clone(),
+            options: options.clone(),
+            picker_sync_attempted: false,
+        }));
+        let sync_context_for_picker = Rc::clone(&sync_context);
+        let picker_sync_action = move || run_picker_sync(&mut sync_context_for_picker.borrow_mut());
+        let picker_result = environment::app_picker::app_picker(
+            picker_options,
+            live_control.take(),
+            picker_sync_action,
+        )?;
+        let mut sync_context = Rc::try_unwrap(sync_context)
+            .unwrap_or_else(|_| unreachable!("picker sync context escaped"))
+            .into_inner();
+        picker_sync_attempted = sync_context.picker_sync_attempted;
+        sync_coordinator = sync_context.coordinator.take();
+        guest_session = sync_context.guest_session.take();
+
+        let Some((bundle_path, mut extra_options)) = picker_result else {
             if let Some(coordinator) = sync_coordinator.as_mut() {
                 coordinator.stop_live().map_err(|error| {
                     format!(
@@ -277,6 +299,7 @@ pub fn main<T: Iterator<Item = String>>(mut args: T) -> Result<(), String> {
         if should_run_picker_sync(
             picker_was_used,
             coordinator.mode() != sync::coordinator::SyncMode::Disabled,
+            picker_sync_attempted,
         ) {
             // The picker session is protected too. Release its lock before the
             // sync that reconciles picker edits, then reacquire it before the
@@ -565,7 +588,7 @@ fn sync_before_guest(
     coordinator: &mut sync::coordinator::GoogleDriveSyncCoordinator,
     options: &options::Options,
     phase: &'static str,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let _timing = SyncGateTiming {
         phase,
         started_at: Instant::now(),
@@ -579,7 +602,7 @@ fn sync_before_guest(
                     sync::status::redacted_error(&error)
                 ));
             }
-            Ok(sync::coordinator::PreLaunchResult::Continue) => return Ok(()),
+            Ok(sync::coordinator::PreLaunchResult::Continue) => return Ok(true),
             Ok(sync::coordinator::PreLaunchResult::LocalOnly(reason))
                 if coordinator.mode() != sync::coordinator::SyncMode::Disabled
                     && !options.headless =>
@@ -589,7 +612,7 @@ fn sync_before_guest(
                     match window::ask_sync_offline_choice(&reason) {
                         Ok(true) => {
                             echo!("Continuing offline for this session: {reason}");
-                            return Ok(());
+                            return Ok(false);
                         }
                         Ok(false) => {
                             result = run_prelaunch_sync(coordinator);
@@ -603,7 +626,7 @@ fn sync_before_guest(
                     match sync::auth::android::request_offline_sync_decision() {
                         Some(true) => {
                             echo!("Continuing offline for this session: {reason}");
-                            return Ok(());
+                            return Ok(false);
                         }
                         Some(false) => {
                             result = run_prelaunch_sync(coordinator);
@@ -626,7 +649,7 @@ fn sync_before_guest(
             }
             Ok(sync::coordinator::PreLaunchResult::LocalOnly(reason)) => {
                 echo!("Cloud sync skipped: {reason}");
-                return Ok(());
+                return Ok(false);
             }
             Ok(sync::coordinator::PreLaunchResult::NeedsResolution(plan)) => {
                 if options.headless {
@@ -645,7 +668,7 @@ fn sync_before_guest(
                     Ok(sync::engine::SyncOutcome::Offline) => {
                         result = run_prelaunch_sync(coordinator);
                     }
-                    Ok(_) => return Ok(()),
+                    Ok(_) => return Ok(true),
                     Err(error @ sync::model::SyncError::UnresolvedConflicts(_)) => {
                         log!(
                             "Cloud conflict selection became stale; refreshing conflict plan: {}",
@@ -663,6 +686,95 @@ fn sync_before_guest(
             }
         }
     }
+}
+
+struct PickerSyncContext {
+    coordinator: Option<sync::coordinator::GoogleDriveSyncCoordinator>,
+    guest_session: Option<sync::locks::LockGuard>,
+    sync_root: PathBuf,
+    options: options::Options,
+    picker_sync_attempted: bool,
+}
+
+fn run_picker_sync(
+    context: &mut PickerSyncContext,
+) -> Result<
+    (
+        Option<sync::live::LiveControl>,
+        Result<environment::app_picker::PickerSyncResult, String>,
+    ),
+    String,
+> {
+    let root = context.sync_root.clone();
+    let options = context.options.clone();
+    let coordinator = context
+        .coordinator
+        .as_mut()
+        .ok_or_else(|| "Cloud sync is unavailable in this session.".to_owned())?;
+
+    context.picker_sync_attempted = true;
+    log!("Google Drive sync requested while the app picker is open");
+    let stop_result = coordinator.stop_live().map_err(|error| {
+        format!(
+            "Cloud observer could not drain: {}",
+            sync::status::redacted_error(&error)
+        )
+    });
+    let sync_result = match stop_result {
+        Err(error) => Err(error),
+        Ok(()) => {
+            drop(context.guest_session.take());
+            match coordinator
+                .refresh_mode(&root, options.headless)
+                .map_err(|error| {
+                    format!(
+                        "Cloud sync settings could not be reloaded: {}",
+                        sync::status::redacted_error(&error)
+                    )
+                }) {
+                Ok(()) => {
+                    sync_before_guest(coordinator, &options, "picker-enable").map(|completed| {
+                        if completed {
+                            environment::app_picker::PickerSyncResult::Completed
+                        } else {
+                            environment::app_picker::PickerSyncResult::Offline
+                        }
+                    })
+                }
+                Err(error) => Err(error),
+            }
+        }
+    };
+    match &sync_result {
+        Ok(environment::app_picker::PickerSyncResult::Completed) => {
+            log!("Google Drive picker sync completed");
+        }
+        Ok(environment::app_picker::PickerSyncResult::Offline) => {
+            log!("Google Drive picker sync continued with local files");
+        }
+        Err(error) => {
+            log!("Google Drive picker sync failed: {error}");
+        }
+    }
+
+    context.guest_session = Some(coordinator.begin_guest_session().map_err(|error| {
+        format!(
+            "Could not protect the picker from background sync: {}",
+            sync::status::redacted_error(&error)
+        )
+    })?);
+    let live_control = if sync_mode_is_active(coordinator.mode()) {
+        Some(coordinator.start_live(&root).map_err(|error| {
+            format!(
+                "Cloud observer could not restart: {}",
+                sync::status::redacted_error(&error)
+            )
+        })?)
+    } else {
+        None
+    };
+
+    Ok((live_control, sync_result))
 }
 
 fn run_prelaunch_sync(
@@ -738,8 +850,12 @@ impl Drop for SyncGateTiming {
     }
 }
 
-fn should_run_picker_sync(picker_was_used: bool, sync_enabled: bool) -> bool {
-    picker_was_used && sync_enabled
+fn should_run_picker_sync(
+    picker_was_used: bool,
+    sync_enabled: bool,
+    picker_sync_attempted: bool,
+) -> bool {
+    picker_was_used && sync_enabled && !picker_sync_attempted
 }
 
 fn sync_mode_is_active(mode: sync::coordinator::SyncMode) -> bool {
@@ -753,10 +869,11 @@ mod picker_sync_tests {
     };
 
     #[test]
-    fn second_prelaunch_sync_requires_picker_and_enabled_sync() {
-        assert!(should_run_picker_sync(true, true));
-        assert!(!should_run_picker_sync(true, false));
-        assert!(!should_run_picker_sync(false, true));
+    fn picker_exit_sync_runs_only_when_no_sync_was_attempted_in_picker() {
+        assert!(should_run_picker_sync(true, true, false));
+        assert!(!should_run_picker_sync(true, false, false));
+        assert!(!should_run_picker_sync(false, true, false));
+        assert!(!should_run_picker_sync(true, true, true));
     }
 
     #[test]
