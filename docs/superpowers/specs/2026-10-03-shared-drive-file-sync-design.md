@@ -1,6 +1,6 @@
 # Shared Google Drive File Sync
 
-- Status: approved direction; pending written-spec review
+- Status: approved by user
 - Date: 2026-10-03
 - Branch: `feat/google-drive-sync`
 - Supersedes: `2026-10-01-google-drive-sync-design.md` remote snapshot/commit model
@@ -70,17 +70,21 @@ explicitly chose to discard. It is replaced.
 
 ### Remote Layout
 
-The app-owned Drive folder contains a `files` subtree mirroring the two
-managed local roots:
+The app-owned Drive folder directly contains the two managed local roots:
 
 ```text
 touchHLE/
-  files/
-    touchHLE_apps/...
-    touchHLE_sandbox/...
+  touchHLE_apps/...
+  touchHLE_sandbox/...
   commits/                  # legacy data, read only during migration
   objects/                  # legacy data, read only during migration
 ```
+
+The former `files/` wrapper is not part of the current layout. When upgrading
+from that layout, move `touchHLE_apps/` and `touchHLE_sandbox/` to this root
+before running the new build, then remove the empty `files/` folder. The v2
+local checkpoint keeps its SHA-256 baseline but drops its Changes cursor and
+folder-ID cache so the new root is inventoried before syncing.
 
 Drive file IDs are cached locally to avoid repeated folder and path lookup.
 Drive file IDs, `version`, checksums, and parent IDs are provider metadata;
@@ -156,8 +160,11 @@ file or absence, and `R` the current Drive file or absence:
 - If neither side changed from `B`, do nothing.
 - If only `L` changed, publish `L` or its deletion.
 - If only `R` changed, download/apply `R` or its deletion.
-- If both changed to the same content hash or both deleted, converge without
-  a conflict.
+- If both changed to the same new content hash or both deleted, converge
+  without a conflict.
+- Drive file ID, revision, size, and modification time are not content
+  identity. If the path and SHA-256 are unchanged, accept metadata changes
+  without a conflict or reopening an otherwise still-valid conflict choice.
 - If both changed differently, pause before mutation and ask the user to
   choose local or remote.
 
@@ -184,10 +191,11 @@ only for paths needed to compare that installation's offline changes.
 ## Concurrent Writes
 
 Before publishing a changed path, fetch its current Drive metadata and compare
-its version/checksum with the version in the plan. If it changed, discard the
-stale plan and re-run comparison so divergent offline edits reach the conflict
-resolver before overwrite. After upload, read back metadata and verify that
-the published content is still current before advancing local state.
+its path and SHA-256 with the content in the plan. If the content changed,
+discard the stale plan and re-run comparison so divergent offline edits reach
+the conflict resolver before overwrite. A revision or file-ID change with the
+same path and SHA-256 does not make the plan stale. After upload, read back
+metadata and verify the published path and SHA-256 before advancing local state.
 
 Drive's documented `files.update` method supports replacing file content but
 does not document an `If-Match`/version precondition. Consequently, exact
@@ -204,7 +212,7 @@ The first run with this schema detects the legacy `commits/` and `objects/`
 layout and does not interpret it as the new live file tree.
 
 - If the legacy history has one unambiguous current tip, materialize that tip
-  into the new `files/` tree after verifying every referenced object.
+  into the new root-level managed tree after verifying every referenced object.
 - If legacy tips diverge, use the existing conflict resolver to select the
   current value per path before materializing.
 - If local files also diverged from the selected legacy baseline, reconcile
@@ -213,7 +221,7 @@ layout and does not interpret it as the new live file tree.
 - Keep legacy `commits/` and `objects/` untouched during migration and do not
   read them again after success. No automatic legacy deletion is performed.
 - On interruption, resume idempotently from a local migration journal. Never
-  treat a partial `files/` tree as a completed migration or replace the legacy
+  treat a partial managed tree as a completed migration or replace the legacy
   baseline with an empty state.
 
 The existing `.touchHLE_sync` state and commit cache require a versioned local
@@ -256,8 +264,8 @@ until the new file tree is verified.
 
 - Never advance the Changes cursor without atomically saving the matching
   baseline.
-- Never overwrite a remote file from a plan whose observed Drive version is
-  stale; re-plan first.
+- Never overwrite remote content whose observed path or SHA-256 is stale;
+  re-plan first. Revision-only changes with the same SHA-256 are acceptable.
 - Download to staging, validate the expected path and content hash, then
   atomically apply.
 - Verify uploads before recording their Drive version/hash in the baseline.

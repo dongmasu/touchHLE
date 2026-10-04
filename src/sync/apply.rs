@@ -3,12 +3,14 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
-use super::merge::{ConflictChoice, SyncPlan};
+use super::merge::{ConflictChoice as LegacyConflictChoice, SyncPlan as LegacySyncPlan};
 use super::model::{LocalOrRemote, RelativePath, SnapshotEntry, SyncError};
+use super::reconcile::{ConflictChoice, RemoteCandidate, RemoteVersionId, SyncPlan};
 use crate::paths::SYNC_DIR;
 use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
 use cap_std::ambient_authority;
 use cap_std::fs::{Dir, DirBuilder, OpenOptions};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
@@ -17,9 +19,16 @@ use unicode_casefold::UnicodeCaseFold;
 use uuid::Uuid;
 
 pub struct StagedFile {
+    root: PathBuf,
     path: RelativePath,
     destination: PathBuf,
     operation: StagedOperation,
+}
+
+impl Drop for StagedFile {
+    fn drop(&mut self) {
+        cleanup_staging(&self.root, std::slice::from_ref(self));
+    }
 }
 
 enum StagedOperation {
@@ -34,9 +43,19 @@ enum StagedOperation {
 /// Only automatic remote actions and explicitly chosen remote versions are applied.
 pub fn stage_remote_files(
     root: &Path,
-    plan: &SyncPlan,
-    choices: &[ConflictChoice],
+    plan: &LegacySyncPlan,
+    choices: &[LegacyConflictChoice],
     read_object: impl FnMut(&[u8; 32]) -> Result<Vec<u8>, SyncError>,
+) -> Result<Vec<StagedFile>, SyncError> {
+    stage_remote_files_with_progress(root, plan, choices, read_object, |_, _, _, _| {})
+}
+
+pub fn stage_remote_files_with_progress(
+    root: &Path,
+    plan: &LegacySyncPlan,
+    choices: &[LegacyConflictChoice],
+    read_object: impl FnMut(&[u8; 32]) -> Result<Vec<u8>, SyncError>,
+    progress: impl FnMut(usize, usize, u64, u64),
 ) -> Result<Vec<StagedFile>, SyncError> {
     let resolved = plan.resolved_snapshot(choices)?;
     let mut entries = BTreeMap::new();
@@ -52,15 +71,142 @@ pub fn stage_remote_files(
             }
         }
     }
-    stage_selected_files(root, &entries, read_object)
+    stage_selected_files(root, &entries, read_object, progress)
 }
 
 fn stage_selected_files(
     root: &Path,
     entries: &BTreeMap<RelativePath, SnapshotEntry>,
     mut read_object: impl FnMut(&[u8; 32]) -> Result<Vec<u8>, SyncError>,
+    mut progress: impl FnMut(usize, usize, u64, u64),
+) -> Result<Vec<StagedFile>, SyncError> {
+    stage_selected_files_by_path(root, entries, |_, hash| read_object(hash), progress)
+}
+
+pub(crate) fn stage_migration_files(
+    root: &Path,
+    entries: &BTreeMap<RelativePath, SnapshotEntry>,
+    read_object: impl FnMut(&[u8; 32]) -> Result<Vec<u8>, SyncError>,
+) -> Result<Vec<StagedFile>, SyncError> {
+    stage_selected_files(root, entries, read_object, |_, _, _, _| {})
+}
+
+/// Stages only automatic remote actions and explicitly selected current Drive
+/// candidates. The complete choice set and resulting tree are validated first.
+pub fn stage_current_files_with_progress(
+    root: &Path,
+    plan: &SyncPlan,
+    choices: &[ConflictChoice],
+    mut read_file: impl FnMut(&str) -> Result<Option<Vec<u8>>, SyncError>,
+    progress: impl FnMut(usize, usize, u64, u64),
+) -> Result<Vec<StagedFile>, SyncError> {
+    plan.resolved_snapshot(choices)?;
+    let mut selected = BTreeMap::<RelativePath, (SnapshotEntry, Option<String>)>::new();
+    for (path, candidate) in &plan.apply_remote {
+        selected.insert(
+            path.clone(),
+            (
+                candidate.entry.clone().unwrap_or(SnapshotEntry::Tombstone),
+                drive_file_id(path, candidate)?,
+            ),
+        );
+    }
+    for choice in choices {
+        if choice.selected != LocalOrRemote::Remote {
+            continue;
+        }
+        let conflict = plan
+            .conflicts
+            .iter()
+            .find(|conflict| conflict.path == choice.path)
+            .ok_or_else(|| SyncError::UnresolvedConflicts("choice no longer exists".into()))?;
+        let candidate = conflict
+            .remote_candidates
+            .iter()
+            .find(|candidate| Some(&candidate.id) == choice.remote_version_id.as_ref())
+            .ok_or_else(|| SyncError::UnresolvedConflicts("remote choice is stale".into()))?;
+        selected.insert(
+            choice.path.clone(),
+            (
+                candidate.entry.clone().unwrap_or(SnapshotEntry::Tombstone),
+                drive_file_id(&choice.path, candidate)?,
+            ),
+        );
+    }
+    stage_selected_files_by_path(
+        root,
+        &selected
+            .iter()
+            .map(|(path, (entry, _))| (path.clone(), entry.clone()))
+            .collect(),
+        |path, hash| {
+            let Some((SnapshotEntry::File { .. }, Some(id))) = selected.get(path) else {
+                return Err(SyncError::Integrity(format!(
+                    "missing Drive file identity for {}",
+                    path.as_str()
+                )));
+            };
+            let bytes = read_file(id)?.ok_or_else(|| {
+                SyncError::Provider(format!(
+                    "selected Drive file disappeared: {}",
+                    path.as_str()
+                ))
+            })?;
+            if Sha256::digest(&bytes).as_slice() != hash {
+                return Err(SyncError::Integrity(format!(
+                    "downloaded file hash mismatch for {}",
+                    path.as_str()
+                )));
+            }
+            Ok(bytes)
+        },
+        progress,
+    )
+}
+
+fn drive_file_id(
+    path: &RelativePath,
+    candidate: &RemoteCandidate,
+) -> Result<Option<String>, SyncError> {
+    match &candidate.id {
+        RemoteVersionId::DriveFile(id)
+            if match (&candidate.entry, &candidate.file) {
+                (None, None) => true,
+                (Some(entry), Some(file)) => {
+                    file.id == *id && file.path == *path && file.entry == *entry
+                }
+                _ => false,
+            } =>
+        {
+            Ok(Some(id.clone()))
+        }
+        RemoteVersionId::DriveFile(_) => Err(SyncError::Integrity(
+            "selected Drive file does not match its path or content".into(),
+        )),
+        RemoteVersionId::LegacyCommit(_) => Err(SyncError::Integrity(
+            "legacy commit candidates cannot be applied by normal sync".into(),
+        )),
+        RemoteVersionId::NoDriveFile => Err(SyncError::Integrity(
+            "migration deletion candidates cannot be applied by normal sync".into(),
+        )),
+    }
+}
+
+fn stage_selected_files_by_path(
+    root: &Path,
+    entries: &BTreeMap<RelativePath, SnapshotEntry>,
+    mut read_content: impl FnMut(&RelativePath, &[u8; 32]) -> Result<Vec<u8>, SyncError>,
+    mut progress: impl FnMut(usize, usize, u64, u64),
 ) -> Result<Vec<StagedFile>, SyncError> {
     validate_selected(entries)?;
+    let files_total = entries
+        .values()
+        .filter(|entry| matches!(entry, SnapshotEntry::File { .. }))
+        .count();
+    let bytes_total = entries.values().fold(0u64, |total, entry| match entry {
+        SnapshotEntry::File { size, .. } => total.saturating_add(*size),
+        SnapshotEntry::Tombstone => total,
+    });
     let root_dir = Dir::open_ambient_dir(root, ambient_authority())?;
     if entries
         .values()
@@ -69,6 +215,7 @@ fn stage_selected_files(
         return Ok(entries
             .keys()
             .map(|path| StagedFile {
+                root: root.to_path_buf(),
                 path: path.clone(),
                 destination: root.join(path.as_str()),
                 operation: StagedOperation::Tombstone,
@@ -79,12 +226,15 @@ fn stage_selected_files(
     let name = format!("stage-{}", Uuid::new_v4());
     let stage_dir = create_private_dir(&sync_dir, &name)?;
     let mut staged = Vec::with_capacity(entries.len());
+    let mut files_done = 0;
+    let mut bytes_done = 0u64;
+    progress(0, files_total, 0, bytes_total);
     let result = (|| {
         for (path, entry) in entries {
             let destination = root.join(path.as_str());
             let operation = match entry {
                 SnapshotEntry::File { sha256, size, .. } => {
-                    let bytes = read_object(sha256)?;
+                    let bytes = read_content(path, sha256)?;
                     if bytes.len() as u64 != *size || Sha256::digest(&bytes).as_slice() != sha256 {
                         return Err(SyncError::Integrity(format!(
                             "downloaded object mismatch for {}",
@@ -96,6 +246,9 @@ fn stage_selected_files(
                         .open_with(&filename, OpenOptions::new().write(true).create_new(true))?;
                     file.write_all(&bytes)?;
                     file.sync_all()?;
+                    files_done += 1;
+                    bytes_done = bytes_done.saturating_add(*size);
+                    progress(files_done, files_total, bytes_done, bytes_total);
                     StagedOperation::File {
                         temporary_path: root.join(SYNC_DIR).join(&name).join(filename),
                         expected_sha256: *sha256,
@@ -104,6 +257,7 @@ fn stage_selected_files(
                 SnapshotEntry::Tombstone => StagedOperation::Tombstone,
             };
             staged.push(StagedFile {
+                root: root.to_path_buf(),
                 path: path.clone(),
                 destination,
                 operation,
@@ -129,11 +283,420 @@ fn apply_staged_files_with_hook(
     staged: Vec<StagedFile>,
     after_backup: impl FnOnce(),
 ) -> Result<(), SyncError> {
-    let result = apply_verified(root, &staged, after_backup);
+    let result = apply_verified(root, &staged, after_backup, true);
     // Staging is scratch space. Cleanup must never turn a successful apply
     // into a reported failure after live files were already changed.
     cleanup_staging(root, &staged);
     result
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+enum TransactionPhase {
+    Prepared,
+    Applying,
+    Applied,
+    Checkpointed,
+    RolledBack,
+}
+
+#[derive(Deserialize, Serialize)]
+struct TransactionJournal {
+    phase: TransactionPhase,
+    directory: String,
+    expected_checkpoint_sha256: [u8; 32],
+    previous_checkpoint: Option<Vec<u8>>,
+    entries: Vec<TransactionEntry>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct TransactionEntry {
+    path: RelativePath,
+    original: TransactionTarget,
+}
+
+#[derive(Deserialize, Serialize)]
+enum TransactionTarget {
+    Missing,
+    Directory,
+    File { backup: String, sha256: [u8; 32] },
+}
+
+/// Applies one local batch and saves its checkpoint as a single recoverable
+/// transaction. The journal remains until the checkpoint replacement succeeds.
+pub fn apply_staged_transaction(
+    root: &Path,
+    staged: Vec<StagedFile>,
+    previous_checkpoint: Option<Vec<u8>>,
+    checkpoint_bytes: &[u8],
+    save_checkpoint: impl FnOnce() -> Result<(), SyncError>,
+    restore_checkpoint: impl FnOnce(Option<&[u8]>) -> Result<(), SyncError>,
+) -> Result<(), SyncError> {
+    apply_staged_transaction_with_hook(
+        root,
+        staged,
+        previous_checkpoint,
+        checkpoint_bytes,
+        save_checkpoint,
+        restore_checkpoint,
+        |_| Ok(()),
+    )
+}
+
+fn apply_staged_transaction_with_hook(
+    root: &Path,
+    staged: Vec<StagedFile>,
+    previous_checkpoint: Option<Vec<u8>>,
+    checkpoint_bytes: &[u8],
+    save_checkpoint: impl FnOnce() -> Result<(), SyncError>,
+    restore_checkpoint: impl FnOnce(Option<&[u8]>) -> Result<(), SyncError>,
+    mut hook: impl FnMut(TransactionPhase) -> Result<(), SyncError>,
+) -> Result<(), SyncError> {
+    if staged.is_empty() {
+        return save_checkpoint();
+    }
+    let root_dir = Dir::open_ambient_dir(root, ambient_authority())?;
+    let sync_dir = open_sync_dir(&root_dir)?;
+    let directory = format!("transaction-{}", Uuid::new_v4());
+    let transaction_dir = create_private_dir(&sync_dir, &directory)?;
+    let mut entries = Vec::with_capacity(staged.len());
+    for (index, item) in staged.iter().enumerate() {
+        let (state, bytes) = target_contents(&root_dir, &item.path)?;
+        let original = match (state, bytes) {
+            (TargetState::Missing, _) => TransactionTarget::Missing,
+            (TargetState::Directory, _) => TransactionTarget::Directory,
+            (TargetState::File(hash), Some(bytes)) => {
+                let backup = index.to_string();
+                let mut file = transaction_dir
+                    .open_with(&backup, OpenOptions::new().write(true).create_new(true))?;
+                file.write_all(&bytes)?;
+                file.sync_all()?;
+                TransactionTarget::File {
+                    backup,
+                    sha256: hash,
+                }
+            }
+            _ => return Err(SyncError::Integrity("invalid transaction target".into())),
+        };
+        entries.push(TransactionEntry {
+            path: item.path.clone(),
+            original,
+        });
+    }
+    let mut journal = TransactionJournal {
+        phase: TransactionPhase::Prepared,
+        directory,
+        expected_checkpoint_sha256: Sha256::digest(checkpoint_bytes).into(),
+        previous_checkpoint,
+        entries,
+    };
+    write_journal(&sync_dir, &journal)?;
+    if let Err(error) = hook(TransactionPhase::Prepared) {
+        rollback_transaction(&root_dir, &sync_dir, &journal)?;
+        restore_checkpoint(journal.previous_checkpoint.as_deref())?;
+        finish_rollback(&sync_dir, &mut journal)?;
+        return Err(error);
+    }
+
+    journal.phase = TransactionPhase::Applying;
+    if let Err(error) = write_journal(&sync_dir, &journal) {
+        rollback_transaction(&root_dir, &sync_dir, &journal)?;
+        restore_checkpoint(journal.previous_checkpoint.as_deref())?;
+        finish_rollback(&sync_dir, &mut journal)?;
+        return Err(error);
+    }
+    if let Err(error) = hook(TransactionPhase::Applying) {
+        rollback_transaction(&root_dir, &sync_dir, &journal)?;
+        restore_checkpoint(journal.previous_checkpoint.as_deref())?;
+        finish_rollback(&sync_dir, &mut journal)?;
+        return Err(error);
+    }
+    let result = report_local_io(
+        "apply staged remote files",
+        apply_verified(root, &staged, || {}, false),
+    );
+    cleanup_staging(root, &staged);
+    if let Err(error) = result {
+        report_local_io(
+            "roll back staged remote files",
+            rollback_transaction(&root_dir, &sync_dir, &journal),
+        )?;
+        restore_checkpoint(journal.previous_checkpoint.as_deref())?;
+        finish_rollback(&sync_dir, &mut journal)?;
+        return Err(error);
+    }
+
+    journal.phase = TransactionPhase::Applied;
+    if let Err(error) = write_journal(&sync_dir, &journal) {
+        rollback_transaction(&root_dir, &sync_dir, &journal)?;
+        restore_checkpoint(journal.previous_checkpoint.as_deref())?;
+        finish_rollback(&sync_dir, &mut journal)?;
+        return Err(error);
+    }
+    if let Err(error) = hook(TransactionPhase::Applied) {
+        rollback_transaction(&root_dir, &sync_dir, &journal)?;
+        restore_checkpoint(journal.previous_checkpoint.as_deref())?;
+        finish_rollback(&sync_dir, &mut journal)?;
+        return Err(error);
+    }
+    if let Err(error) = report_local_io("save sync checkpoint", save_checkpoint()) {
+        restore_checkpoint(journal.previous_checkpoint.as_deref())?;
+        report_local_io(
+            "roll back files after checkpoint failure",
+            rollback_transaction(&root_dir, &sync_dir, &journal),
+        )?;
+        finish_rollback(&sync_dir, &mut journal)?;
+        return Err(error);
+    }
+    journal.phase = TransactionPhase::Checkpointed;
+    if let Err(error) =
+        write_journal(&sync_dir, &journal).and_then(|()| hook(TransactionPhase::Checkpointed))
+    {
+        restore_checkpoint(journal.previous_checkpoint.as_deref())?;
+        rollback_transaction(&root_dir, &sync_dir, &journal)?;
+        finish_rollback(&sync_dir, &mut journal)?;
+        return Err(error);
+    }
+    // Cleanup is recoverable: after the checkpoint commits, a leftover journal
+    // is finalized on the next sync rather than reported as a failed operation.
+    let _ = cleanup_transaction(&sync_dir, &journal);
+    Ok(())
+}
+
+/// Recovers an interrupted local transaction before planning another batch.
+/// A matching checkpoint means the prior operation committed; otherwise all
+/// displaced bytes and the prior checkpoint are restored.
+pub fn recover_transaction(
+    root: &Path,
+    checkpoint_bytes: Option<&[u8]>,
+    restore_checkpoint: impl FnOnce(Option<&[u8]>) -> Result<(), SyncError>,
+) -> Result<(), SyncError> {
+    let root_dir = Dir::open_ambient_dir(root, ambient_authority())?;
+    let sync_dir = open_sync_dir(&root_dir)?;
+    let mut file = match open_regular(&sync_dir, "transaction.json") {
+        Ok(file) => file,
+        Err(SyncError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            return cleanup_orphan_staging(&sync_dir)
+        }
+        Err(error) => return Err(error),
+    };
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    let journal: TransactionJournal = serde_json::from_slice(&bytes)?;
+    validate_journal(&journal)?;
+    if journal.phase == TransactionPhase::RolledBack {
+        cleanup_transaction(&sync_dir, &journal)?;
+        return cleanup_orphan_staging(&sync_dir);
+    }
+    if checkpoint_bytes.map(|bytes| <[u8; 32]>::from(Sha256::digest(bytes)))
+        == Some(journal.expected_checkpoint_sha256)
+    {
+        cleanup_transaction(&sync_dir, &journal)?;
+        return cleanup_orphan_staging(&sync_dir);
+    }
+    report_local_io(
+        "roll back interrupted file transaction",
+        rollback_transaction(&root_dir, &sync_dir, &journal),
+    )?;
+    report_local_io(
+        "restore interrupted sync checkpoint",
+        restore_checkpoint(journal.previous_checkpoint.as_deref()),
+    )?;
+    let mut journal = journal;
+    report_local_io(
+        "finish interrupted transaction rollback",
+        finish_rollback(&sync_dir, &mut journal),
+    )?;
+    report_local_io(
+        "clean up interrupted sync staging",
+        cleanup_orphan_staging(&sync_dir),
+    )
+}
+
+fn validate_journal(journal: &TransactionJournal) -> Result<(), SyncError> {
+    if !journal.directory.starts_with("transaction-")
+        || journal.directory.contains(['/', '\\'])
+        || journal.directory == "transaction-"
+        || journal.entries.iter().enumerate().any(|(index, entry)| {
+            matches!(
+                &entry.original,
+                TransactionTarget::File { backup, .. } if *backup != index.to_string()
+            )
+        })
+    {
+        return Err(SyncError::Integrity(
+            "invalid transaction journal paths".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn cleanup_orphan_staging(sync_dir: &Dir) -> Result<(), SyncError> {
+    for item in sync_dir.read_dir(".")? {
+        let name = item?
+            .file_name()
+            .into_string()
+            .map_err(|_| SyncError::Integrity("invalid sync scratch name".into()))?;
+        if !name.starts_with("stage-") && !name.starts_with("transaction-") {
+            continue;
+        }
+        if !sync_dir.symlink_metadata(&name)?.is_dir() {
+            return Err(SyncError::Integrity(
+                "sync scratch directory is not a directory".into(),
+            ));
+        }
+        sync_dir.remove_dir_all(&name)?;
+    }
+    Ok(())
+}
+
+fn finish_rollback(sync_dir: &Dir, journal: &mut TransactionJournal) -> Result<(), SyncError> {
+    journal.phase = TransactionPhase::RolledBack;
+    write_journal(sync_dir, journal)?;
+    cleanup_transaction(sync_dir, journal)
+}
+
+fn write_journal(sync_dir: &Dir, journal: &TransactionJournal) -> Result<(), SyncError> {
+    let temporary = format!(".transaction-{}", Uuid::new_v4());
+    let result = (|| {
+        let mut file = report_local_io(
+            "create transaction journal temporary file",
+            sync_dir
+                .open_with(&temporary, OpenOptions::new().write(true).create_new(true))
+                .map_err(SyncError::from),
+        )?;
+        report_local_io(
+            "write transaction journal",
+            file.write_all(&serde_json::to_vec(journal)?)
+                .map_err(SyncError::from),
+        )?;
+        report_local_io(
+            "sync transaction journal",
+            file.sync_all().map_err(SyncError::from),
+        )?;
+        drop(file);
+        report_local_io(
+            "replace transaction journal",
+            sync_dir
+                .rename(&temporary, sync_dir, "transaction.json")
+                .map_err(SyncError::from),
+        )?;
+        report_local_io(
+            "sync transaction journal directory",
+            sync_directory(sync_dir),
+        )?;
+        Ok::<_, SyncError>(())
+    })();
+    let _ = sync_dir.remove_file(&temporary);
+    result
+}
+
+fn report_local_io<T>(
+    operation: &'static str,
+    result: Result<T, SyncError>,
+) -> Result<T, SyncError> {
+    if let Err(SyncError::Io(error)) = &result {
+        log!(
+            "Google Drive local I/O failed during {operation} (kind={:?}, os_error={:?})",
+            error.kind(),
+            error.raw_os_error()
+        );
+    }
+    result
+}
+
+fn rollback_transaction(
+    root: &Dir,
+    sync_dir: &Dir,
+    journal: &TransactionJournal,
+) -> Result<(), SyncError> {
+    let transaction_dir = sync_dir.open_dir_nofollow(&journal.directory)?;
+    let mut paths: Vec<_> = journal.entries.iter().collect();
+    paths.sort_by_key(|entry| std::cmp::Reverse(entry.path.as_str().matches('/').count()));
+    for entry in &paths {
+        remove_transaction_target(root, &entry.path)?;
+    }
+    paths.sort_by_key(|entry| entry.path.as_str().matches('/').count());
+    for entry in paths {
+        match &entry.original {
+            TransactionTarget::Missing => {}
+            TransactionTarget::Directory => {
+                let (parent, name) = open_parent(root, &entry.path, true)?.unwrap();
+                match parent.create_dir(name) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                        if !parent.symlink_metadata(name)?.is_dir() {
+                            return Err(SyncError::InvalidPath(entry.path.as_str().into()));
+                        }
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            TransactionTarget::File { backup, sha256 } => {
+                let bytes = read_regular(&transaction_dir, backup)?;
+                verify_hash(&bytes, sha256)?;
+                restore_transaction_file(root, &entry.path, &bytes)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn remove_transaction_target(root: &Dir, path: &RelativePath) -> Result<(), SyncError> {
+    let Some((parent, name)) = open_parent(root, path, false)? else {
+        return Ok(());
+    };
+    match parent.symlink_metadata(name) {
+        Ok(metadata) if metadata.is_file() => parent.remove_file(name)?,
+        Ok(metadata) if metadata.is_dir() => parent.remove_dir(name)?,
+        Ok(_) => return Err(SyncError::InvalidPath(path.as_str().into())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    Ok(())
+}
+
+fn restore_transaction_file(
+    root: &Dir,
+    path: &RelativePath,
+    bytes: &[u8],
+) -> Result<(), SyncError> {
+    let (parent, name) = open_parent(root, path, true)?.unwrap();
+    let temporary = format!(".touchHLE-restore-{}", Uuid::new_v4());
+    let result = (|| {
+        let mut file =
+            parent.open_with(&temporary, OpenOptions::new().write(true).create_new(true))?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        parent.rename(&temporary, &parent, name)?;
+        Ok::<_, SyncError>(())
+    })();
+    let _ = parent.remove_file(&temporary);
+    result
+}
+
+fn cleanup_transaction(sync_dir: &Dir, journal: &TransactionJournal) -> Result<(), SyncError> {
+    match sync_dir.remove_dir_all(&journal.directory) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    sync_dir.remove_file("transaction.json")?;
+    sync_directory(sync_dir)
+}
+
+pub(super) fn sync_directory(dir: &Dir) -> Result<(), SyncError> {
+    #[cfg(target_os = "android")]
+    {
+        // Android's emulated external storage returns EBADF for directory fsync.
+        let _ = dir;
+        Ok(())
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        dir.try_clone()?.into_std_file().sync_all()?;
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -147,6 +710,7 @@ fn apply_verified(
     root: &Path,
     staged: &[StagedFile],
     after_backup: impl FnOnce(),
+    preserve_recovery: bool,
 ) -> Result<(), SyncError> {
     let root_dir = Dir::open_ambient_dir(root, ambient_authority())?;
     let mut selected = BTreeMap::new();
@@ -197,8 +761,10 @@ fn apply_verified(
     let mut initial = Vec::with_capacity(staged.len());
     for item in staged {
         let (state, bytes) = target_contents(&root_dir, &item.path)?;
-        if let (TargetState::File(hash), Some(bytes)) = (state, bytes) {
-            preserve_bytes(&root_dir, &bytes, &hash)?;
+        if preserve_recovery {
+            if let (TargetState::File(hash), Some(bytes)) = (state, bytes) {
+                preserve_bytes(&root_dir, &bytes, &hash)?;
+            }
         }
         initial.push(state);
     }
@@ -229,11 +795,21 @@ fn apply_verified(
             let temporary = format!(".touchHLE-sync-{}", Uuid::new_v4());
             let mut created = false;
             let result = (|| {
-                let mut file = parent
-                    .open_with(&temporary, OpenOptions::new().write(true).create_new(true))?;
+                let mut file = report_local_io(
+                    "create local replacement file",
+                    parent
+                        .open_with(&temporary, OpenOptions::new().write(true).create_new(true))
+                        .map_err(SyncError::from),
+                )?;
                 created = true;
-                file.write_all(bytes)?;
-                file.sync_all()?;
+                report_local_io(
+                    "write local replacement file",
+                    file.write_all(bytes).map_err(SyncError::from),
+                )?;
+                report_local_io(
+                    "sync local replacement file",
+                    file.sync_all().map_err(SyncError::from),
+                )?;
                 drop(file);
                 let expected = if *expected == TargetState::Directory {
                     TargetState::Missing
@@ -241,7 +817,12 @@ fn apply_verified(
                     *expected
                 };
                 check_target(&root_dir, &item.path, expected)?;
-                parent.rename(&temporary, &parent, name)?;
+                report_local_io(
+                    "replace local file",
+                    parent
+                        .rename(&temporary, &parent, name)
+                        .map_err(SyncError::from),
+                )?;
                 Ok::<_, SyncError>(())
             })();
             if created {
@@ -323,6 +904,7 @@ fn check_target(
     Ok(current)
 }
 
+#[cfg(test)]
 pub fn preserve_local_version(
     root: &Path,
     path: &RelativePath,
@@ -599,6 +1181,242 @@ mod tests {
 
     fn entries(name: &str, entry: SnapshotEntry) -> BTreeMap<RelativePath, SnapshotEntry> {
         BTreeMap::from([(RelativePath::new(name).unwrap(), entry)])
+    }
+
+    #[test]
+    fn current_staging_reads_chosen_drive_id_and_checks_hash_and_size() {
+        let tree = TestTree::new();
+        let path = RelativePath::new("touchHLE_apps/save").unwrap();
+        let entry = file_entry(b"remote");
+        let file = crate::sync::reconcile::RemoteFile {
+            path: path.clone(),
+            id: "selected-file".into(),
+            version: "3".into(),
+            entry: entry.clone(),
+            parent_id: None,
+        };
+        let plan = crate::sync::reconcile::SyncPlan {
+            apply_remote: BTreeMap::from([(
+                path.clone(),
+                crate::sync::reconcile::RemoteCandidate {
+                    id: crate::sync::reconcile::RemoteVersionId::DriveFile(file.id.clone()),
+                    entry: Some(entry),
+                    file: Some(file),
+                },
+            )]),
+            ..Default::default()
+        };
+        let mut requested = Vec::new();
+        let staged = stage_current_files_with_progress(
+            &tree.0,
+            &plan,
+            &[],
+            |id| {
+                requested.push(id.to_owned());
+                Ok(Some(b"remote".to_vec()))
+            },
+            |_, _, _, _| {},
+        )
+        .unwrap();
+        assert_eq!(requested, ["selected-file"]);
+        assert_eq!(staged.len(), 1);
+        assert!(!tree.file("save").exists());
+        drop(staged);
+
+        assert!(matches!(
+            stage_current_files_with_progress(
+                &tree.0,
+                &plan,
+                &[],
+                |_| Ok(Some(b"wrong".to_vec())),
+                |_, _, _, _| {}
+            ),
+            Err(SyncError::Integrity(_))
+        ));
+    }
+
+    #[test]
+    fn injected_transaction_failures_restore_original_file_and_checkpoint() {
+        for phase in [
+            TransactionPhase::Prepared,
+            TransactionPhase::Applying,
+            TransactionPhase::Applied,
+            TransactionPhase::Checkpointed,
+        ] {
+            let tree = TestTree::new();
+            fs::write(tree.file("save"), b"original").unwrap();
+            let checkpoint = tree.0.join(SYNC_DIR).join("state.json");
+            fs::create_dir(checkpoint.parent().unwrap()).unwrap();
+            fs::write(&checkpoint, b"old checkpoint").unwrap();
+            let staged = stage_remote_files(
+                &tree.0,
+                &entries("touchHLE_apps/save", file_entry(b"chosen")),
+                |_| Ok(b"chosen".to_vec()),
+            )
+            .unwrap();
+            let result = apply_staged_transaction_with_hook(
+                &tree.0,
+                staged,
+                Some(b"old checkpoint".to_vec()),
+                b"new checkpoint",
+                || fs::write(&checkpoint, b"new checkpoint").map_err(Into::into),
+                |bytes| fs::write(&checkpoint, bytes.unwrap()).map_err(Into::into),
+                |at| {
+                    if at == phase {
+                        Err(SyncError::Provider("injected transaction failure".into()))
+                    } else {
+                        Ok(())
+                    }
+                },
+            );
+            assert!(matches!(result, Err(SyncError::Provider(_))), "{phase:?}");
+            assert_eq!(
+                fs::read(tree.file("save")).unwrap(),
+                b"original",
+                "{phase:?}"
+            );
+            assert_eq!(
+                fs::read(checkpoint).unwrap(),
+                b"old checkpoint",
+                "{phase:?}"
+            );
+            assert!(!tree.0.join(SYNC_DIR).join("transaction.json").exists());
+            assert!(!tree.0.join(SYNC_DIR).join("recovery").exists());
+        }
+    }
+
+    #[test]
+    fn checkpoint_save_failure_rolls_back_and_restart_replays_old_cursor() {
+        let tree = TestTree::new();
+        fs::write(tree.file("save"), b"original").unwrap();
+        let checkpoint = tree.0.join(SYNC_DIR).join("state.json");
+        fs::create_dir(checkpoint.parent().unwrap()).unwrap();
+        fs::write(&checkpoint, b"old cursor").unwrap();
+        let staged = stage_remote_files(
+            &tree.0,
+            &entries("touchHLE_apps/save", file_entry(b"chosen")),
+            |_| Ok(b"chosen".to_vec()),
+        )
+        .unwrap();
+        assert!(apply_staged_transaction(
+            &tree.0,
+            staged,
+            Some(b"old cursor".to_vec()),
+            b"new cursor",
+            || Err(SyncError::Io(std::io::Error::other(
+                "injected checkpoint error"
+            ))),
+            |bytes| fs::write(&checkpoint, bytes.unwrap()).map_err(Into::into),
+        )
+        .is_err());
+        assert_eq!(fs::read(tree.file("save")).unwrap(), b"original");
+        assert_eq!(fs::read(&checkpoint).unwrap(), b"old cursor");
+        recover_transaction(&tree.0, Some(b"old cursor"), |_| Ok(())).unwrap();
+        assert!(!tree.0.join(SYNC_DIR).join("recovery").exists());
+    }
+
+    #[test]
+    fn failed_checkpoint_restores_complete_multifile_apply_without_recovery_copies() {
+        let tree = TestTree::new();
+        fs::write(tree.file("a"), b"old a").unwrap();
+        fs::write(tree.file("b"), b"old b").unwrap();
+        let selected = BTreeMap::from([
+            (
+                RelativePath::new("touchHLE_apps/a").unwrap(),
+                file_entry(b"new a"),
+            ),
+            (
+                RelativePath::new("touchHLE_apps/b").unwrap(),
+                file_entry(b"new b"),
+            ),
+        ]);
+        let first_hash: [u8; 32] = Sha256::digest(b"new a").into();
+        let staged = stage_remote_files(&tree.0, &selected, |hash| {
+            if *hash == first_hash {
+                Ok(b"new a".to_vec())
+            } else {
+                Ok(b"new b".to_vec())
+            }
+        })
+        .unwrap();
+        assert!(apply_staged_transaction(
+            &tree.0,
+            staged,
+            None,
+            b"new checkpoint",
+            || Err(SyncError::Provider("injected save failure".into())),
+            |_| Ok(()),
+        )
+        .is_err());
+        assert_eq!(fs::read(tree.file("a")).unwrap(), b"old a");
+        assert_eq!(fs::read(tree.file("b")).unwrap(), b"old b");
+        assert!(!tree.0.join(SYNC_DIR).join("recovery").exists());
+        assert!(!tree.0.join(SYNC_DIR).join("transaction.json").exists());
+    }
+
+    #[test]
+    fn recovery_cleans_unjournaled_private_staging() {
+        let tree = TestTree::new();
+        let root = Dir::open_ambient_dir(&tree.0, ambient_authority()).unwrap();
+        let sync = open_sync_dir(&root).unwrap();
+        let orphan = create_private_dir(&sync, "stage-orphan").unwrap();
+        orphan
+            .open_with("0", OpenOptions::new().write(true).create_new(true))
+            .unwrap();
+        recover_transaction(&tree.0, None, |_| panic!("no checkpoint to restore")).unwrap();
+        assert!(!tree.0.join(SYNC_DIR).join("stage-orphan").exists());
+    }
+
+    #[test]
+    fn interrupted_apply_recovers_only_when_checkpoint_is_not_committed() {
+        for committed in [false, true] {
+            let tree = TestTree::new();
+            fs::write(tree.file("save"), b"selected").unwrap();
+            let root = Dir::open_ambient_dir(&tree.0, ambient_authority()).unwrap();
+            let sync = open_sync_dir(&root).unwrap();
+            let txn = create_private_dir(&sync, "transaction-test").unwrap();
+            let mut backup = txn
+                .open_with("0", OpenOptions::new().write(true).create_new(true))
+                .unwrap();
+            backup.write_all(b"original").unwrap();
+            backup.sync_all().unwrap();
+            let journal = TransactionJournal {
+                phase: TransactionPhase::Applying,
+                directory: "transaction-test".into(),
+                expected_checkpoint_sha256: Sha256::digest(b"new checkpoint").into(),
+                previous_checkpoint: Some(b"old checkpoint".to_vec()),
+                entries: vec![TransactionEntry {
+                    path: RelativePath::new("touchHLE_apps/save").unwrap(),
+                    original: TransactionTarget::File {
+                        backup: "0".into(),
+                        sha256: Sha256::digest(b"original").into(),
+                    },
+                }],
+            };
+            write_journal(&sync, &journal).unwrap();
+            let checkpoint = if committed {
+                b"new checkpoint".as_slice()
+            } else {
+                b"old checkpoint".as_slice()
+            };
+            let mut restored = false;
+            recover_transaction(&tree.0, Some(checkpoint), |before| {
+                assert_eq!(before, Some(b"old checkpoint".as_slice()));
+                restored = true;
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(restored, !committed);
+            assert_eq!(
+                fs::read(tree.file("save")).unwrap(),
+                if committed {
+                    b"selected".as_slice()
+                } else {
+                    b"original".as_slice()
+                }
+            );
+            assert!(!tree.0.join(SYNC_DIR).join("transaction.json").exists());
+        }
     }
 
     #[test]

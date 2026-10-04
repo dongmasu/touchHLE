@@ -9,7 +9,7 @@
 //! - [Technical Q&A QA1588: Automatic orientation support for iPhone and iPad apps](https://developer.apple.com/library/archive/qa/qa1588/_index.html)
 //! - [Technical Q&A QA1688: Why won't my UIViewController rotate with the device?](https://developer.apple.com/library/archive/qa/qa1688/_index.html)
 
-use super::UIViewHostObject;
+use super::{layer_trees_share_root, UIViewHostObject};
 use crate::dyld::{ConstantExports, HostConstant};
 use crate::frameworks::core_graphics::cg_affine_transform::CGAffineTransform;
 use crate::frameworks::core_graphics::{CGPoint, CGRect};
@@ -231,6 +231,10 @@ pub const CLASSES: ClassExports = objc_classes! {
     let this_layer: id = msg![env; this layer];
     // Resolves to nil if other is nil.
     let other_layer: id = msg![env; other layer];
+    if other != nil && !layer_trees_share_root(env, this_layer, other_layer) {
+        log_once!("UIWindow coordinate conversion crossed detached layer trees; preserving coordinates");
+        return point;
+    }
     msg![env; this_layer convertPoint:point fromLayer:other_layer]
 }
 - (CGPoint)convertPoint:(CGPoint)point
@@ -238,6 +242,10 @@ pub const CLASSES: ClassExports = objc_classes! {
     let this_layer: id = msg![env; this layer];
     // Resolves to nil if other is nil.
     let other_layer: id = msg![env; other layer];
+    if other != nil && !layer_trees_share_root(env, this_layer, other_layer) {
+        log_once!("UIWindow coordinate conversion crossed detached layer trees; preserving coordinates");
+        return point;
+    }
     msg![env; this_layer convertPoint:point toLayer:other_layer]
 }
 

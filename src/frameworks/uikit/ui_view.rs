@@ -145,6 +145,26 @@ fn init_common(env: &mut Environment, this: id) -> id {
     this
 }
 
+fn same_non_nil_layer_root(this_root: id, other_root: id) -> bool {
+    this_root != nil && this_root == other_root
+}
+
+pub(super) fn layer_trees_share_root(env: &mut Environment, this: id, other: id) -> bool {
+    fn root_layer(env: &mut Environment, mut layer: id) -> id {
+        while layer != nil {
+            let superlayer: id = msg![env; layer superlayer];
+            if superlayer == nil {
+                return layer;
+            }
+            layer = superlayer;
+        }
+        nil
+    }
+
+    let this_root = root_layer(env, this);
+    same_non_nil_layer_root(this_root, root_layer(env, other))
+}
+
 pub const CLASSES: ClassExports = objc_classes! {
 
 (env, this, _cmd);
@@ -796,20 +816,47 @@ pub const CLASSES: ClassExports = objc_classes! {
     }
     // TODO: avoid copy somehow?
     let subviews = env.objc.borrow::<UIViewHostObject>(this).subviews.clone();
-    for subview in subviews.into_iter().rev() { // later views are on top
+    // Keep the snapshot alive if a nested hitTest changes the view hierarchy.
+    for &subview in &subviews {
+        retain(env, subview);
+    }
+    let parent_layer = env.objc.borrow::<UIViewHostObject>(this).layer;
+    let mut hit_view = nil;
+    for &subview in subviews.iter().rev() { // later views are on top
+        let subview_superview: id = msg![env; subview superview];
+        let subview_layer = env.objc.borrow::<UIViewHostObject>(subview).layer;
+        let subview_superlayer: id = msg![env; subview_layer superlayer];
+        if subview_superview != this || subview_superlayer != parent_layer {
+            log!(
+                "Skipping detached UIView {:?} during hit testing in {:?}",
+                subview,
+                this
+            );
+            continue;
+        }
         let hidden: bool = msg![env; subview isHidden];
         let alpha: CGFloat = msg![env; subview alpha];
         let interactible: bool = msg![env; subview isUserInteractionEnabled];
         if hidden || alpha < 0.01 || !interactible {
-           continue;
+            continue;
         }
         let point: CGPoint = msg![env; subview convertPoint:point fromView:this];
-        let subview: id = msg![env; subview hitTest:point withEvent:event];
-        if subview != nil {
-            return subview;
+        let candidate: id = msg![env; subview hitTest:point withEvent:event];
+        if candidate != nil {
+            hit_view = candidate;
+            break;
         }
     }
-    this
+    for subview in subviews {
+        release(env, subview);
+    }
+    if hit_view != nil {
+        retain(env, hit_view);
+        autorelease(env, hit_view);
+        hit_view
+    } else {
+        this
+    }
 }
 
 // Ending a view-editing session
@@ -856,6 +903,10 @@ pub const CLASSES: ClassExports = objc_classes! {
     }
     let this_layer = env.objc.borrow::<UIViewHostObject>(this).layer;
     let other_layer = env.objc.borrow::<UIViewHostObject>(other).layer;
+    if !layer_trees_share_root(env, this_layer, other_layer) {
+        log_once!("UIView coordinate conversion crossed detached layer trees; preserving coordinates");
+        return point;
+    }
     msg![env; this_layer convertPoint:point fromLayer:other_layer]
 }
 - (CGPoint)convertPoint:(CGPoint)point
@@ -867,6 +918,10 @@ pub const CLASSES: ClassExports = objc_classes! {
     }
     let this_layer = env.objc.borrow::<UIViewHostObject>(this).layer;
     let other_layer = env.objc.borrow::<UIViewHostObject>(other).layer;
+    if !layer_trees_share_root(env, this_layer, other_layer) {
+        log_once!("UIView coordinate conversion crossed detached layer trees; preserving coordinates");
+        return point;
+    }
     msg![env; this_layer convertPoint:point toLayer:other_layer]
 }
 - (CGRect)convertRect:(CGRect)rect
@@ -878,6 +933,10 @@ pub const CLASSES: ClassExports = objc_classes! {
     }
     let this_layer = env.objc.borrow::<UIViewHostObject>(this).layer;
     let other_layer = env.objc.borrow::<UIViewHostObject>(other).layer;
+    if !layer_trees_share_root(env, this_layer, other_layer) {
+        log_once!("UIView coordinate conversion crossed detached layer trees; preserving coordinates");
+        return rect;
+    }
     msg![env; this_layer convertRect:rect fromLayer:other_layer]
 }
 - (CGRect)convertRect:(CGRect)rect
@@ -889,6 +948,10 @@ pub const CLASSES: ClassExports = objc_classes! {
     }
     let this_layer = env.objc.borrow::<UIViewHostObject>(this).layer;
     let other_layer = env.objc.borrow::<UIViewHostObject>(other).layer;
+    if !layer_trees_share_root(env, this_layer, other_layer) {
+        log_once!("UIView coordinate conversion crossed detached layer trees; preserving coordinates");
+        return rect;
+    }
     msg![env; this_layer convertRect:rect toLayer:other_layer]
 }
 
@@ -1008,3 +1071,18 @@ pub const CLASSES: ClassExports = objc_classes! {
 @end
 
 };
+
+#[cfg(test)]
+mod coordinate_space_tests {
+    use super::*;
+
+    #[test]
+    fn detached_layer_roots_are_not_treated_as_a_shared_coordinate_space() {
+        let first = id::from_bits(1);
+        let second = id::from_bits(2);
+        assert!(same_non_nil_layer_root(first, first));
+        assert!(!same_non_nil_layer_root(first, second));
+        assert!(!same_non_nil_layer_root(nil, nil));
+        assert!(!same_non_nil_layer_root(first, nil));
+    }
+}

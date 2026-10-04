@@ -110,8 +110,10 @@ pub fn handle_events(env: &mut Environment) -> Option<Instant> {
     while let Some(event) = env.window_mut().pop_event() {
         match event {
             Event::Quit => {
-                echo!("User requested quit, exiting.");
-                ui_application::exit(env);
+                if !env.exit_requested() {
+                    echo!("User requested quit, exiting.");
+                    ui_application::exit(env);
+                }
             }
             Event::TouchesDown(..) | Event::TouchesMove(..) | Event::TouchesUp(..) => {
                 ui_touch::handle_event(env, event)

@@ -121,6 +121,8 @@ pub struct Environment {
     /// Set to [true] when created using [Environment::new_without_app].
     pub dump_file: Option<std::fs::File>,
     pub is_app_picker: bool,
+    exit_code: Option<i32>,
+    exit_requested_at: Option<Instant>,
     yielder: *const Yielder<Environment, Environment>,
     // The amount of ticks to run for Some(value), or single-stepping for None.
     // Sadly, setting ticks to 1 does not step properly, so Option is required.
@@ -136,6 +138,10 @@ enum ThreadNextAction {
     ReturnToHost,
     /// Debug the current CPU error.
     DebugCpuError(cpu::CpuError),
+}
+
+fn should_continue_cpu_execution(exit_requested: bool, remaining_ticks: Option<u64>) -> bool {
+    !exit_requested && remaining_ticks.is_none_or(|ticks| ticks > 0)
 }
 
 /// If/what a thread is blocked by.
@@ -412,7 +418,8 @@ impl Environment {
                 ),
                 icon.ok(),
                 launch_image,
-                &options,
+                &mut options,
+                false,
             )))
         };
 
@@ -643,7 +650,9 @@ impl Environment {
                         .branch_with_link(entry_point_addr, env.dyld.thread_exit_routine());
                     env.run_call();
 
-                    panic!("Main function exited unexpectedly!");
+                    if env.exit_code.is_none() {
+                        panic!("Main function exited unexpectedly!");
+                    }
                 })
             }));
             if let Err(e) = res {
@@ -684,6 +693,8 @@ impl Environment {
             env_vars: Default::default(),
             dump_file: None,
             is_app_picker: false,
+            exit_code: None,
+            exit_requested_at: None,
             yielder: std::ptr::null(),
             remaining_ticks: None,
             panic_cell: Rc::new(Cell::new(None)),
@@ -738,7 +749,7 @@ impl Environment {
     /// do not need to be aware of the app picker's peculiarities, so it is
     /// cleaner than the alternative!
     pub fn new_without_app(
-        options: options::Options,
+        mut options: options::Options,
         icon: image::Image,
     ) -> Result<Environment, String> {
         // Enforces a one (real) Environment limit. See `with_yielder` for
@@ -768,7 +779,8 @@ impl Environment {
             ),
             Some(icon),
             launch_image,
-            &options,
+            &mut options,
+            true,
         )));
 
         let mut mem = mem::Mem::new();
@@ -816,6 +828,8 @@ impl Environment {
             env_vars: Default::default(),
             dump_file: None,
             is_app_picker: true,
+            exit_code: None,
+            exit_requested_at: None,
             yielder: std::ptr::null(),
             remaining_ticks: None,
             panic_cell: Rc::new(Cell::new(None)),
@@ -875,6 +889,8 @@ impl Environment {
             env_vars: HashMap::new(),
             dump_file: None,
             is_app_picker: true,
+            exit_code: None,
+            exit_requested_at: None,
             yielder: std::ptr::null(),
             remaining_ticks: None,
             panic_cell: Rc::new(Cell::new(None)),
@@ -938,6 +954,17 @@ impl Environment {
         self.window.as_mut().expect(
             "Tried to do something that needs a window, but touchHLE is running in headless mode!",
         )
+    }
+
+    pub fn request_exit(&mut self, exit_code: i32) {
+        if self.exit_code.is_none() {
+            self.exit_code = Some(exit_code);
+            self.exit_requested_at = Some(Instant::now());
+        }
+    }
+
+    pub fn exit_requested(&self) -> bool {
+        self.exit_code.is_some()
     }
 
     pub fn stack_for_longjmp(&self, mut lr: u32, fp: u32) -> Vec<u32> {
@@ -1291,6 +1318,9 @@ impl Environment {
             }
         });
         loop {
+            if let Some(window) = self.window.as_mut() {
+                window.on_main_stack = false;
+            }
             let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 app_picker_coroutine.resume(self)
             }));
@@ -1309,6 +1339,9 @@ impl Environment {
                 }
             };
 
+            if let Some(window) = self.window.as_mut() {
+                window.on_main_stack = true;
+            }
             self.window
                 .as_mut()
                 .unwrap()
@@ -1330,7 +1363,7 @@ impl Environment {
 
     /// Run the emulator. This is the main loop and won't return until app exit.
     /// Only `main.rs` should call this.
-    pub fn run(mut self) {
+    pub fn run(mut self) -> i32 {
         let mut curr_host_context = self.threads[0].host_context.take().unwrap();
         let panic_cell = self.panic_cell.clone();
         if let Some(mut gdb_server) = self.gdb_server.take() {
@@ -1397,6 +1430,25 @@ impl Environment {
                 }
             };
 
+            if self.exit_code.is_some() && !kill_current_thread {
+                // Let the suspended guest call stack unwind through its
+                // normal return path without running the guest scheduler.
+                loop {
+                    // The guest may yield again while unwinding. The regular
+                    // scheduler would unblock it before every resume.
+                    self.threads[self.current_thread].blocked_by = ThreadBlock::NotBlocked;
+                    self.remaining_ticks = Some(0);
+                    match curr_host_context.resume(self) {
+                        corosensei::CoroutineResult::Yield(env) => self = env,
+                        corosensei::CoroutineResult::Return(env) => {
+                            self = env;
+                            kill_current_thread = true;
+                            break;
+                        }
+                    }
+                }
+            }
+
             let mut old_context = if kill_current_thread {
                 log_dbg!("Killing thread {}", self.current_thread);
                 panic_cell.set(Some(self));
@@ -1414,6 +1466,18 @@ impl Environment {
             } else {
                 Some(curr_host_context)
             };
+
+            if let Some(exit_code) = self.exit_code {
+                let exit_elapsed = self.exit_requested_at.map(|started| started.elapsed());
+                drop(self);
+                if let Some(elapsed) = exit_elapsed {
+                    log!(
+                        "Guest environment shutdown completed in {} ms after exit was requested",
+                        elapsed.as_millis()
+                    );
+                }
+                return exit_code;
+            }
 
             if let Some(w) = self.window.as_mut() {
                 w.on_main_stack = true;
@@ -1643,10 +1707,10 @@ impl Environment {
         assert!(self.threads[initial_thread].guest_context.is_none());
 
         loop {
-            while self
-                .remaining_ticks
-                .is_none_or(|remaining_ticks| remaining_ticks > 0)
-            {
+            if self.exit_code.is_some() {
+                return;
+            }
+            while should_continue_cpu_execution(self.exit_code.is_some(), self.remaining_ticks) {
                 let state = self
                     .cpu
                     .run_or_step(&mut self.mem, self.remaining_ticks.as_mut());
@@ -1662,6 +1726,9 @@ impl Environment {
                         self.debug_cpu_error(e);
                     }
                 }
+            }
+            if self.exit_code.is_some() {
+                return;
             }
             self.yield_thread(ThreadBlock::NotBlocked);
         }
@@ -1920,12 +1987,16 @@ impl Environment {
                 let wrapped = WindowWrapper {
                     window: self.window.as_mut().unwrap(),
                 };
+                let was_on_main_stack = wrapped.window.on_main_stack;
                 let res = yielder.on_parent_stack(|| {
                     let wrapped = wrapped;
                     wrapped.window.on_main_stack = true;
                     f(wrapped.window, self.options.as_mut())
                 });
-                self.window.as_mut().unwrap().on_main_stack = false;
+                restore_on_main_stack_state(
+                    &mut self.window.as_mut().unwrap().on_main_stack,
+                    was_on_main_stack,
+                );
                 res
             }
         } else {
@@ -1935,6 +2006,10 @@ impl Environment {
             f(self.window.as_mut().unwrap(), self.options.as_mut())
         }
     }
+}
+
+fn restore_on_main_stack_state(on_main_stack: &mut bool, previous_state: bool) {
+    *on_main_stack = previous_state;
 }
 
 impl Drop for Environment {
@@ -1975,6 +2050,113 @@ impl Drop for Environment {
             *self = env;
         }
         ENVIRONMENT_INSTANCE_EXISTS.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod shutdown_tests {
+    use super::*;
+    use std::process::Command;
+
+    fn environment_with_exiting_guest() -> Environment {
+        let mut mem = mem::Mem::new();
+        let stack = mem.alloc(4096);
+        let stack_start = stack.to_bits();
+        let mut objc = objc::ObjC::new();
+        let mut dyld = dyld::Dyld::new();
+        dyld.do_initial_linking_with_no_bins(&mut mem, &mut objc);
+        let cpu = cpu::Cpu::new(None);
+        let host_context = Coroutine::new(|yielder, mut env: Environment| {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                env.with_yielder(yielder, |env| {
+                    env.remaining_ticks = Some(0);
+                    env.request_exit(0);
+                    env.yield_thread(ThreadBlock::Sleeping(
+                        Instant::now() + Duration::from_secs(60),
+                    ));
+                    env.remaining_ticks = Some(0);
+                    env.yield_thread(ThreadBlock::Sleeping(
+                        Instant::now() + Duration::from_secs(60),
+                    ));
+                    env.run_inner();
+                })
+            }));
+            if let Err(payload) = result {
+                let panic_cell = env.panic_cell.clone();
+                panic_cell.set(Some(env));
+                std::panic::resume_unwind(payload);
+            }
+            env
+        });
+        let main_thread = Thread {
+            state: ThreadState::Running,
+            blocked_by: ThreadBlock::NotBlocked,
+            return_value: None,
+            guest_context: None,
+            host_context: Some(host_context),
+            stack: Some(stack_start..=stack_start + 4095),
+            framework_state: Default::default(),
+        };
+
+        Environment {
+            startup_time: Instant::now(),
+            bundle: NullableBox::new(bundle::Bundle::new_fake_bundle()),
+            fs: NullableBox::new(fs::Fs::new_fake_fs()),
+            window: None,
+            openal_manager: NullableBox::new(OpenALManager::new().unwrap()),
+            mem: NullableBox::new(mem),
+            bins: Vec::new(),
+            objc: NullableBox::new(objc),
+            dyld: NullableBox::new(dyld),
+            cpu: NullableBox::new(cpu),
+            current_thread: 0,
+            threads: vec![main_thread],
+            libc_state: Default::default(),
+            mutex_state: Default::default(),
+            framework_state: Default::default(),
+            options: NullableBox::new(options::Options::default()),
+            gdb_server: None,
+            env_vars: HashMap::new(),
+            dump_file: None,
+            is_app_picker: false,
+            exit_code: None,
+            exit_requested_at: None,
+            yielder: std::ptr::null(),
+            remaining_ticks: None,
+            panic_cell: Rc::new(Cell::new(None)),
+        }
+    }
+
+    #[test]
+    fn quit_resumes_suspended_guest_context_before_returning_to_host() {
+        const CHILD_PROCESS: &str = "TOUCHHLE_TEST_EXITING_GUEST_CHILD";
+        if std::env::var_os(CHILD_PROCESS).is_some() {
+            assert_eq!(environment_with_exiting_guest().run(), 0);
+            return;
+        }
+
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "environment::shutdown_tests::quit_resumes_suspended_guest_context_before_returning_to_host",
+            ])
+            .env(CHILD_PROCESS, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "child did not return through Environment::run:\n{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn guest_exit_stops_cpu_execution_even_with_ticks_remaining() {
+        assert!(should_continue_cpu_execution(false, Some(1)));
+        assert!(!should_continue_cpu_execution(true, Some(100_000)));
+        assert!(!should_continue_cpu_execution(true, None));
+        assert!(!should_continue_cpu_execution(false, Some(0)));
     }
 }
 
@@ -2140,5 +2322,19 @@ mod dylib_sorting_tests {
             result.is_err(),
             "Sort should detect self-dependency as a cycle and return an error"
         );
+    }
+}
+
+#[cfg(test)]
+mod stack_state_tests {
+    use super::restore_on_main_stack_state;
+
+    #[test]
+    fn parent_stack_return_restores_the_previous_stack_state() {
+        for previous_state in [false, true] {
+            let mut on_main_stack = true;
+            restore_on_main_stack_state(&mut on_main_stack, previous_state);
+            assert_eq!(on_main_stack, previous_state);
+        }
     }
 }

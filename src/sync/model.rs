@@ -38,6 +38,15 @@ impl RelativePath {
     }
 }
 
+pub fn is_ignored_sync_file(path: &RelativePath) -> bool {
+    let Some(name) = path.as_str().rsplit('/').next() else {
+        return false;
+    };
+    [".DS_Store", "Thumbs.db", "ehthumbs.db", "desktop.ini"]
+        .iter()
+        .any(|ignored| name.eq_ignore_ascii_case(ignored))
+}
+
 fn invalid_component(part: &str) -> bool {
     if part.is_empty()
         || part == "."
@@ -103,7 +112,8 @@ pub struct SyncState {
 
 pub type LegacySyncState = SyncState;
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 2;
+pub const CURRENT_SCHEMA_VERSION: u32 = 3;
+const PREVIOUS_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -113,6 +123,8 @@ pub struct CurrentSyncState {
     pub account_id: Option<String>,
     pub root_folder_id: Option<String>,
     pub changes_cursor: Option<String>,
+    #[serde(default)]
+    pub migration_marker_confirmed: bool,
     #[serde(deserialize_with = "deserialize_baseline")]
     pub baseline: BTreeMap<RelativePath, FileBaseline>,
     pub file_paths_by_id: BTreeMap<String, RelativePath>,
@@ -127,6 +139,7 @@ impl CurrentSyncState {
             account_id: None,
             root_folder_id: None,
             changes_cursor: None,
+            migration_marker_confirmed: false,
             baseline: BTreeMap::new(),
             file_paths_by_id: BTreeMap::new(),
             folder_paths_by_id: BTreeMap::new(),
@@ -143,9 +156,11 @@ impl CurrentSyncState {
         self.baseline
             .retain(|path, _| local.contains_key(path) || remote.contains_key(path));
         self.file_paths_by_id.retain(|id, path| {
-            self.baseline
-                .get(path)
-                .is_some_and(|baseline| baseline.remote_id.as_deref() == Some(id.as_str()))
+            is_ignored_sync_file(path)
+                || self
+                    .baseline
+                    .get(path)
+                    .is_some_and(|baseline| baseline.remote_id.as_deref() == Some(id.as_str()))
         });
     }
 }
@@ -170,12 +185,23 @@ pub fn load_sync_state(bytes: Option<&[u8]>) -> Result<LoadedSyncState, SyncErro
         let state: CurrentSyncState = serde_json::from_slice(bytes).map_err(|error| {
             SyncError::Integrity(format!("invalid current checkpoint: {error}"))
         })?;
-        if state.schema_version != CURRENT_SCHEMA_VERSION {
-            return Err(SyncError::Integrity(
-                "unsupported sync checkpoint version".into(),
-            ));
+        match state.schema_version {
+            CURRENT_SCHEMA_VERSION => return Ok(LoadedSyncState::Current(state)),
+            PREVIOUS_SCHEMA_VERSION => {
+                let mut migrated = state;
+                migrated.schema_version = CURRENT_SCHEMA_VERSION;
+                migrated.changes_cursor = None;
+                migrated.migration_marker_confirmed = false;
+                migrated.file_paths_by_id.clear();
+                migrated.folder_paths_by_id.clear();
+                return Ok(LoadedSyncState::Current(migrated));
+            }
+            _ => {
+                return Err(SyncError::Integrity(
+                    "unsupported sync checkpoint version".into(),
+                ));
+            }
         }
-        return Ok(LoadedSyncState::Current(state));
     }
     if !object.contains_key("device_id")
         || !object.contains_key("last_applied_commit")
@@ -305,9 +331,11 @@ pub enum SyncError {
     InvalidPath(String),
     Serialization(serde_json::Error),
     Integrity(String),
+    RemotePathExists,
     Provider(String),
     Authentication(String),
     UnresolvedConflicts(String),
+    MigrationRequired,
 }
 
 impl fmt::Display for SyncError {
@@ -317,9 +345,11 @@ impl fmt::Display for SyncError {
             Self::InvalidPath(path) => write!(f, "invalid sync path: {path}"),
             Self::Serialization(e) => write!(f, "sync serialization error: {e}"),
             Self::Integrity(message) => write!(f, "sync integrity failure: {message}"),
+            Self::RemotePathExists => write!(f, "remote sync path already exists"),
             Self::Provider(message) => write!(f, "sync provider failure: {message}"),
             Self::Authentication(message) => write!(f, "sync authentication failure: {message}"),
             Self::UnresolvedConflicts(message) => write!(f, "unresolved sync conflicts: {message}"),
+            Self::MigrationRequired => write!(f, "legacy sync state requires migration"),
         }
     }
 }
@@ -425,6 +455,7 @@ mod tests {
             account_id: Some("account".into()),
             root_folder_id: Some("root".into()),
             changes_cursor: Some("cursor".into()),
+            migration_marker_confirmed: false,
             baseline: BTreeMap::from([(
                 path.clone(),
                 FileBaseline {
@@ -440,6 +471,55 @@ mod tests {
             load_sync_state(Some(&serde_json::to_vec(&current).unwrap())).unwrap(),
             LoadedSyncState::Current(state) if state == current
         ));
+        let mut pre_marker: serde_json::Value = serde_json::to_value(&current).unwrap();
+        pre_marker
+            .as_object_mut()
+            .unwrap()
+            .remove("migration_marker_confirmed");
+        assert!(matches!(
+            load_sync_state(Some(&serde_json::to_vec(&pre_marker).unwrap())).unwrap(),
+            LoadedSyncState::Current(state) if !state.migration_marker_confirmed
+        ));
+    }
+
+    #[test]
+    fn previous_checkpoint_rebuilds_remote_indexes_without_losing_baseline() {
+        let path = RelativePath::new("touchHLE_apps/save").unwrap();
+        let old = CurrentSyncState {
+            schema_version: PREVIOUS_SCHEMA_VERSION,
+            device_id: Uuid::new_v4(),
+            account_id: Some("account".into()),
+            root_folder_id: Some("root".into()),
+            changes_cursor: Some("old-cursor".into()),
+            migration_marker_confirmed: true,
+            baseline: BTreeMap::from([(
+                path.clone(),
+                FileBaseline {
+                    sha256: Some([7; 32]),
+                    remote_id: Some("drive-file".into()),
+                    remote_version: Some("12".into()),
+                },
+            )]),
+            file_paths_by_id: BTreeMap::from([("drive-file".into(), path)]),
+            folder_paths_by_id: BTreeMap::from([(
+                "apps-folder".into(),
+                "touchHLE/touchHLE_apps".into(),
+            )]),
+        };
+        let expected_baseline = old.baseline.clone();
+
+        let LoadedSyncState::Current(migrated) =
+            load_sync_state(Some(&serde_json::to_vec(&old).unwrap())).unwrap()
+        else {
+            panic!("old current checkpoint should migrate in place");
+        };
+
+        assert_eq!(migrated.schema_version, CURRENT_SCHEMA_VERSION);
+        assert_eq!(migrated.baseline, expected_baseline);
+        assert!(migrated.changes_cursor.is_none());
+        assert!(!migrated.migration_marker_confirmed);
+        assert!(migrated.file_paths_by_id.is_empty());
+        assert!(migrated.folder_paths_by_id.is_empty());
     }
 
     #[test]

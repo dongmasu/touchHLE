@@ -121,10 +121,6 @@ pub fn sync_state_path() -> PathBuf {
     sync_data_path().join("state.json")
 }
 
-pub fn sync_recovery_path() -> PathBuf {
-    sync_data_path().join("recovery")
-}
-
 /// Get a platform-specific base path needed for accessing touchHLE's
 /// user-modifiable files. This is empty on platforms other than Android.
 pub fn user_data_base_path() -> Cow<'static, Path> {

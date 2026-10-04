@@ -60,6 +60,7 @@ mod window;
 use environment::{Environment, MutexId, MutexType, ThreadId, PTHREAD_MUTEX_DEFAULT};
 
 use std::path::PathBuf;
+use std::time::Instant;
 
 pub use touchHLE_version::*;
 
@@ -182,6 +183,53 @@ pub fn main<T: Iterator<Item = String>>(mut args: T) -> Result<(), String> {
         return Ok(());
     }
 
+    if bundle_path.is_none() && options.headless {
+        return Err("No app specified. Use the --help flag to see command-line usage.".to_string());
+    }
+
+    // Sync before enumerating the app directory so apps present only in Drive
+    // are available in the picker on a new device. Informational launches stay
+    // local-only and never wait for cloud access.
+    let sync_root = paths::user_data_base_path().to_path_buf();
+    let mut sync_coordinator = if just_info {
+        None
+    } else {
+        let mut coordinator =
+            sync::coordinator::google_drive_coordinator(&sync_root, options.headless).map_err(
+                |error| {
+                    format!(
+                        "Cloud sync settings could not be loaded: {}",
+                        sync::status::redacted_error(&error)
+                    )
+                },
+            )?;
+        sync_before_guest(&mut coordinator, &options, "startup")?;
+        Some(coordinator)
+    };
+    let mut live_control = sync_coordinator
+        .as_mut()
+        .filter(|coordinator| sync_mode_is_active(coordinator.mode()))
+        .map(|coordinator| coordinator.start_live(&sync_root))
+        .transpose()
+        .map_err(|error| {
+            format!(
+                "Cloud observer could not start: {}",
+                sync::status::redacted_error(&error)
+            )
+        })?;
+    let mut guest_session = sync_coordinator
+        .as_ref()
+        .filter(|coordinator| sync_mode_is_active(coordinator.mode()))
+        .map(|coordinator| coordinator.begin_guest_session())
+        .transpose()
+        .map_err(|error| {
+            format!(
+                "Could not protect the active touchHLE session from background sync: {}",
+                sync::status::redacted_error(&error)
+            )
+        })?;
+    let picker_was_used = bundle_path.is_none();
+
     let bundle_path = if let Some(bundle_path) = bundle_path {
         bundle_path
     } else {
@@ -191,18 +239,67 @@ pub fn main<T: Iterator<Item = String>>(mut args: T) -> Result<(), String> {
             let parse_result = options.parse_argument(option_arg);
             assert!(parse_result == Ok(true));
         }
-        if options.headless {
-            return Err(
-                "No app specified. Use the --help flag to see command-line usage.".to_string(),
-            );
-        }
         echo!(
             "No app specified, opening app picker. Use the --help flag to see command-line usage."
         );
-        let (bundle_path, mut extra_options) = environment::app_picker::app_picker(options)?;
+        let Some((bundle_path, mut extra_options)) =
+            environment::app_picker::app_picker(options, live_control.take())?
+        else {
+            if let Some(coordinator) = sync_coordinator.as_mut() {
+                coordinator.stop_live().map_err(|error| {
+                    format!(
+                        "Cloud observer could not drain: {}",
+                        sync::status::redacted_error(&error)
+                    )
+                })?;
+            }
+            return Ok(());
+        };
         option_args.append(&mut extra_options);
         bundle_path
     };
+
+    if let Some(coordinator) = sync_coordinator.as_mut() {
+        coordinator.stop_live().map_err(|error| {
+            format!(
+                "Cloud observer could not drain: {}",
+                sync::status::redacted_error(&error)
+            )
+        })?;
+        coordinator
+            .refresh_mode(&sync_root, options.headless)
+            .map_err(|error| {
+                format!(
+                    "Cloud sync settings could not be reloaded: {}",
+                    sync::status::redacted_error(&error)
+                )
+            })?;
+        if should_run_picker_sync(
+            picker_was_used,
+            coordinator.mode() != sync::coordinator::SyncMode::Disabled,
+        ) {
+            // The picker session is protected too. Release its lock before the
+            // sync that reconciles picker edits, then reacquire it before the
+            // guest environment can be constructed.
+            drop(guest_session.take());
+            // Reconcile edits made while the picker was open before starting the guest.
+            sync_before_guest(coordinator, &options, "after-picker")?;
+            guest_session = Some(coordinator.begin_guest_session().map_err(|error| {
+                format!(
+                    "Could not protect the guest session from background sync: {}",
+                    sync::status::redacted_error(&error)
+                )
+            })?);
+        }
+        if sync_mode_is_active(coordinator.mode()) {
+            coordinator.start_live(&sync_root).map_err(|error| {
+                format!(
+                    "Cloud observer could not restart: {}",
+                    sync::status::redacted_error(&error)
+                )
+            })?;
+        }
+    }
 
     // When PowerShell does tab-completion on a directory, for some reason it
     // expands it to `'..\My Bundle.app\'` and that trailing \ seems to
@@ -212,6 +309,8 @@ pub fn main<T: Iterator<Item = String>>(mut args: T) -> Result<(), String> {
         log!("Warning: The bundle path has a trailing quotation mark! This often happens accidentally on Windows when tab-completing, because '\\\"' gets interpreted by Rust in the wrong way. Did you meant to write {:?}?", fixed);
     }
 
+    let app_selected_at = Instant::now();
+    let app_open_started = Instant::now();
     let bundle_data = fs::BundleData::open_any(&bundle_path)
         .map_err(|e| format!("Could not open app bundle: {e}"))?;
     let (bundle, fs) = match bundle::Bundle::new_bundle_and_fs_from_host_path(
@@ -223,6 +322,10 @@ pub fn main<T: Iterator<Item = String>>(mut args: T) -> Result<(), String> {
             return Err(format!("Application bundle error: {err}. Check that the path is to an .app directory or an .ipa file."));
         }
     };
+    log!(
+        "Selected app bundle opened in {} ms",
+        app_open_started.elapsed().as_millis()
+    );
 
     let app_id = bundle.bundle_identifier();
     let minimum_os_version = bundle.minimum_os_version();
@@ -339,10 +442,11 @@ pub fn main<T: Iterator<Item = String>>(mut args: T) -> Result<(), String> {
         assert!(parse_result == Ok(true));
     }
 
+    let environment_init_started = Instant::now();
     let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         Environment::new(bundle, fs, options.clone(), app_args.unwrap_or_default())
     }));
-    let env = match res {
+    let mut env = match res {
         Ok(ret) => match ret {
             Ok(env) => env,
             Err(e) => {
@@ -366,6 +470,308 @@ pub fn main<T: Iterator<Item = String>>(mut args: T) -> Result<(), String> {
             std::panic::resume_unwind(e)
         }
     };
-    env.run();
+    log!(
+        "Guest environment initialized in {} ms",
+        environment_init_started.elapsed().as_millis()
+    );
+    if let Some(window) = env.window.as_mut() {
+        window.set_guest_launch_started_at(app_selected_at);
+    }
+    let exit_code = env.run();
+    log!("Emulator returned with exit code {exit_code}; beginning cloud shutdown");
+    // `Environment::run` consumes and destroys the guest environment before
+    // returning, so releasing this lock now makes remote apply safe.
+    drop(guest_session);
+    #[cfg(target_os = "android")]
+    sync::auth::android::enqueue_final_sync();
+    if let Some(coordinator) = sync_coordinator
+        .as_mut()
+        .filter(|coordinator| coordinator.mode() != sync::coordinator::SyncMode::Disabled)
+    {
+        loop {
+            let result = run_shutdown_sync(coordinator);
+            match result {
+                Ok(sync::engine::SyncOutcome::Conflicts(plan)) if !options.headless => {
+                    match environment::app_picker::resolve_conflicts_gui(options.clone(), &plan) {
+                        Ok(Some(choices)) => {
+                            if let Err(error) =
+                                resolve_conflicts_with_progress(coordinator, &plan, &choices)
+                            {
+                                echo!("Warning: cloud conflicts were preserved but not resolved: {}", sync::status::redacted_error(&error));
+                            }
+                        }
+                        Ok(None) => echo!(
+                            "Cloud conflicts were preserved for a later run; no version was selected."
+                        ),
+                        Err(error) => echo!(
+                            "Warning: cloud conflicts were preserved; the resolver could not be opened: {error}"
+                        ),
+                    }
+                    break;
+                }
+                Ok(sync::engine::SyncOutcome::Offline) if !options.headless => {
+                    let reason =
+                        "Google Drive is unavailable. Local game data has not been discarded.";
+                    match ask_shutdown_sync_retry(reason) {
+                        Ok(true) => continue,
+                        Ok(false) => echo!(
+                            "Exiting with local game data preserved; cloud sync can retry next launch."
+                        ),
+                        Err(error) => echo!(
+                            "Could not show shutdown sync choices ({error}); local game data was preserved."
+                        ),
+                    }
+                    break;
+                }
+                Ok(sync::engine::SyncOutcome::Offline) => {
+                    echo!("Shutdown cloud sync was unavailable; local game data was preserved.");
+                    break;
+                }
+                Ok(sync::engine::SyncOutcome::Conflicts(_)) => {
+                    echo!("Cloud conflicts were preserved for a later graphical run.");
+                    break;
+                }
+                Ok(_) => break,
+                Err(error) if !options.headless => {
+                    let reason = sync::status::redacted_error(&error);
+                    match ask_shutdown_sync_retry(&reason) {
+                        Ok(true) => continue,
+                        Ok(false) => echo!(
+                            "Exiting with local game data preserved; cloud sync can retry next launch."
+                        ),
+                        Err(choice_error) => echo!(
+                            "Could not show shutdown sync choices ({choice_error}); local game data was preserved."
+                        ),
+                    }
+                    break;
+                }
+                Err(error) => {
+                    echo!(
+                        "Warning: shutdown cloud sync did not complete: {}",
+                        sync::status::redacted_error(&error)
+                    );
+                    break;
+                }
+            }
+        }
+    }
+    if exit_code != 0 {
+        std::process::exit(exit_code);
+    }
     Ok(())
+}
+
+fn sync_before_guest(
+    coordinator: &mut sync::coordinator::GoogleDriveSyncCoordinator,
+    options: &options::Options,
+    phase: &'static str,
+) -> Result<(), String> {
+    let _timing = SyncGateTiming {
+        phase,
+        started_at: Instant::now(),
+    };
+    let mut result = run_prelaunch_sync(coordinator);
+    loop {
+        match result {
+            Err(error) => {
+                return Err(format!(
+                    "Cloud sync failed before app launch: {}",
+                    sync::status::redacted_error(&error)
+                ));
+            }
+            Ok(sync::coordinator::PreLaunchResult::Continue) => return Ok(()),
+            Ok(sync::coordinator::PreLaunchResult::LocalOnly(reason))
+                if coordinator.mode() != sync::coordinator::SyncMode::Disabled
+                    && !options.headless =>
+            {
+                #[cfg(not(target_os = "android"))]
+                {
+                    match window::ask_sync_offline_choice(&reason) {
+                        Ok(true) => {
+                            echo!("Continuing offline for this session: {reason}");
+                            return Ok(());
+                        }
+                        Ok(false) => {
+                            result = run_prelaunch_sync(coordinator);
+                        }
+                        Err(error) => return Err(error),
+                    }
+                    continue;
+                }
+                #[cfg(target_os = "android")]
+                {
+                    match sync::auth::android::request_offline_sync_decision() {
+                        Some(true) => {
+                            echo!("Continuing offline for this session: {reason}");
+                            return Ok(());
+                        }
+                        Some(false) => {
+                            result = run_prelaunch_sync(coordinator);
+                        }
+                        None => {
+                            return Err(
+                                "Cloud sync decision was not received; no game was started."
+                                    .to_owned(),
+                            );
+                        }
+                    }
+                    continue;
+                }
+            }
+            Ok(sync::coordinator::PreLaunchResult::LocalOnly(reason))
+                if coordinator.mode() != sync::coordinator::SyncMode::Disabled
+                    && options.headless =>
+            {
+                return Err(format!("Cloud sync unavailable in headless mode: {reason}"));
+            }
+            Ok(sync::coordinator::PreLaunchResult::LocalOnly(reason)) => {
+                echo!("Cloud sync skipped: {reason}");
+                return Ok(());
+            }
+            Ok(sync::coordinator::PreLaunchResult::NeedsResolution(plan)) => {
+                if options.headless {
+                    return Err(
+                        "Cloud sync has file conflicts. Run touchHLE graphically to choose versions."
+                            .to_owned(),
+                    );
+                }
+                let choices =
+                    environment::app_picker::resolve_conflicts_gui(options.clone(), &plan)?
+                        .ok_or_else(|| "Cloud conflict resolution was cancelled.".to_owned())?;
+                match resolve_conflicts_with_progress(coordinator, &plan, &choices) {
+                    Ok(sync::engine::SyncOutcome::Conflicts(next)) => {
+                        result = Ok(sync::coordinator::PreLaunchResult::NeedsResolution(next));
+                    }
+                    Ok(sync::engine::SyncOutcome::Offline) => {
+                        result = run_prelaunch_sync(coordinator);
+                    }
+                    Ok(_) => return Ok(()),
+                    Err(error @ sync::model::SyncError::UnresolvedConflicts(_)) => {
+                        log!(
+                            "Cloud conflict selection became stale; refreshing conflict plan: {}",
+                            sync::status::redacted_error(&error)
+                        );
+                        result = run_prelaunch_sync(coordinator);
+                    }
+                    Err(error) => {
+                        return Err(format!(
+                            "Cloud conflict resolution failed: {}",
+                            sync::status::redacted_error(&error)
+                        ));
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn run_prelaunch_sync(
+    coordinator: &mut sync::coordinator::GoogleDriveSyncCoordinator,
+) -> Result<sync::coordinator::PreLaunchResult, sync::model::SyncError> {
+    if coordinator.mode() == sync::coordinator::SyncMode::Enabled {
+        return window::run_with_sync_progress(
+            "touchHLE - Starting Google Drive sync",
+            |progress| coordinator.before_launch_with_progress(progress),
+        );
+    }
+    coordinator.before_launch()
+}
+
+fn resolve_conflicts_with_progress(
+    coordinator: &mut sync::coordinator::GoogleDriveSyncCoordinator,
+    plan: &sync::reconcile::SyncPlan,
+    choices: &[sync::reconcile::ConflictChoice],
+) -> Result<sync::engine::SyncOutcome, sync::model::SyncError> {
+    if coordinator.mode() == sync::coordinator::SyncMode::Enabled {
+        return window::run_with_sync_progress(
+            "touchHLE - Applying Google Drive sync choices",
+            |progress| coordinator.resolve_conflicts_with_progress(plan, choices, progress),
+        );
+    }
+    coordinator.resolve_conflicts(plan, choices)
+}
+
+fn run_shutdown_sync(
+    coordinator: &mut sync::coordinator::GoogleDriveSyncCoordinator,
+) -> Result<sync::engine::SyncOutcome, sync::model::SyncError> {
+    if coordinator.mode() == sync::coordinator::SyncMode::Enabled {
+        return window::run_with_sync_progress("touchHLE - Final Google Drive sync", |progress| {
+            coordinator.shutdown_sync_with_progress(progress)
+        });
+    }
+    coordinator.shutdown_sync()
+}
+
+fn ask_shutdown_sync_retry(reason: &str) -> Result<bool, String> {
+    #[cfg(target_os = "android")]
+    {
+        echo!("Shutdown cloud sync needs a decision: {reason}");
+        sync::auth::android::request_offline_sync_decision()
+            .map(retry_shutdown_sync_from_android_choice)
+            .ok_or_else(|| {
+                "No shutdown cloud sync decision was received; local data was preserved.".to_owned()
+            })
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        window::ask_sync_shutdown_retry(reason)
+    }
+}
+
+#[cfg(any(target_os = "android", test))]
+fn retry_shutdown_sync_from_android_choice(continue_offline: bool) -> bool {
+    !continue_offline
+}
+
+struct SyncGateTiming {
+    phase: &'static str,
+    started_at: Instant,
+}
+
+impl Drop for SyncGateTiming {
+    fn drop(&mut self) {
+        log!(
+            "Cloud sync {} gate finished in {} ms",
+            self.phase,
+            self.started_at.elapsed().as_millis()
+        );
+    }
+}
+
+fn should_run_picker_sync(picker_was_used: bool, sync_enabled: bool) -> bool {
+    picker_was_used && sync_enabled
+}
+
+fn sync_mode_is_active(mode: sync::coordinator::SyncMode) -> bool {
+    mode != sync::coordinator::SyncMode::Disabled
+}
+
+#[cfg(test)]
+mod picker_sync_tests {
+    use super::{
+        retry_shutdown_sync_from_android_choice, should_run_picker_sync, sync_mode_is_active,
+    };
+
+    #[test]
+    fn second_prelaunch_sync_requires_picker_and_enabled_sync() {
+        assert!(should_run_picker_sync(true, true));
+        assert!(!should_run_picker_sync(true, false));
+        assert!(!should_run_picker_sync(false, true));
+    }
+
+    #[test]
+    fn disabled_sync_skips_live_observer_and_guest_session_locks() {
+        assert!(!sync_mode_is_active(
+            super::sync::coordinator::SyncMode::Disabled
+        ));
+        assert!(sync_mode_is_active(
+            super::sync::coordinator::SyncMode::Enabled
+        ));
+    }
+
+    #[test]
+    fn android_shutdown_choice_maps_retry_and_local_exit_correctly() {
+        assert!(retry_shutdown_sync_from_android_choice(false));
+        assert!(!retry_shutdown_sync_from_android_choice(true));
+    }
 }

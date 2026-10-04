@@ -40,6 +40,7 @@ pub struct FileBaseline {
 pub enum RemoteVersionId {
     DriveFile(String),
     LegacyCommit(Uuid),
+    NoDriveFile,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -76,6 +77,201 @@ pub struct SyncPlan {
     pub apply_remote: BTreeMap<RelativePath, RemoteCandidate>,
     pub publish_local: BTreeMap<RelativePath, Option<SnapshotEntry>>,
     pub conflicts: Vec<FileConflict>,
+    pub local_snapshot: BTreeMap<RelativePath, SnapshotEntry>,
+}
+
+impl SyncPlan {
+    pub fn has_same_content_as(&self, other: &Self) -> bool {
+        same_entry_map(&self.local_snapshot, &other.local_snapshot)
+            && same_optional_entry_map(&self.publish_local, &other.publish_local)
+            && same_candidate_map(&self.apply_remote, &other.apply_remote)
+            && self.conflicts.len() == other.conflicts.len()
+            && self
+                .conflicts
+                .iter()
+                .zip(&other.conflicts)
+                .all(|(left, right)| {
+                    left.path == right.path
+                        && same_optional_entry(left.local.as_ref(), right.local.as_ref())
+                        && left.remote_candidates.len() == right.remote_candidates.len()
+                        && left
+                            .remote_candidates
+                            .iter()
+                            .zip(&right.remote_candidates)
+                            .all(|(a, b)| same_candidate_content(a, b))
+                })
+    }
+
+    /// Resolve all displayed choices together and reject an invalid final tree
+    /// before any selected remote bytes are read or any live files are changed.
+    pub fn resolved_snapshot(
+        &self,
+        choices: &[ConflictChoice],
+    ) -> Result<BTreeMap<RelativePath, SnapshotEntry>, SyncError> {
+        let mut selected = BTreeMap::new();
+        for choice in choices {
+            if !self
+                .conflicts
+                .iter()
+                .any(|conflict| conflict.path == choice.path)
+            {
+                return Err(SyncError::UnresolvedConflicts(format!(
+                    "no conflict at path {}",
+                    choice.path.as_str()
+                )));
+            }
+            if selected.insert(&choice.path, choice).is_some() {
+                return Err(SyncError::UnresolvedConflicts(format!(
+                    "duplicate choice at {}",
+                    choice.path.as_str()
+                )));
+            }
+        }
+        if selected.len() != self.conflicts.len() {
+            return Err(SyncError::UnresolvedConflicts(
+                "a choice is required for every conflict".into(),
+            ));
+        }
+
+        let mut resolved = self.local_snapshot.clone();
+        for (path, entry) in &self.publish_local {
+            resolved.insert(
+                path.clone(),
+                entry.clone().unwrap_or(SnapshotEntry::Tombstone),
+            );
+        }
+        for (path, candidate) in &self.apply_remote {
+            resolved.insert(
+                path.clone(),
+                candidate.entry.clone().unwrap_or(SnapshotEntry::Tombstone),
+            );
+        }
+        for conflict in &self.conflicts {
+            let choice = selected[&conflict.path];
+            let action = resolve_conflict(conflict, choice)?;
+            let entry = match action {
+                PathAction::PublishLocal(entry) => entry.unwrap_or(SnapshotEntry::Tombstone),
+                PathAction::ApplyRemote(candidate) => {
+                    candidate.entry.unwrap_or(SnapshotEntry::Tombstone)
+                }
+                _ => unreachable!("validated conflict choices always select a side"),
+            };
+            resolved.insert(conflict.path.clone(), entry);
+        }
+        validate_entries(&resolved).map_err(SyncError::UnresolvedConflicts)?;
+        Ok(resolved)
+    }
+}
+
+pub fn rebind_conflict_choices(
+    displayed_plan: &SyncPlan,
+    current_plan: &SyncPlan,
+    choices: &[ConflictChoice],
+) -> Result<Vec<ConflictChoice>, SyncError> {
+    choices
+        .iter()
+        .map(|choice| {
+            let mut rebound = choice.clone();
+            if choice.selected == LocalOrRemote::Remote {
+                let displayed = displayed_plan
+                    .conflicts
+                    .iter()
+                    .find(|conflict| conflict.path == choice.path)
+                    .ok_or_else(|| {
+                        SyncError::UnresolvedConflicts("displayed conflict is stale".into())
+                    })?;
+                let selected_id = choice.remote_version_id.as_ref().ok_or_else(|| {
+                    SyncError::UnresolvedConflicts("remote choice has no candidate".into())
+                })?;
+                let selected = displayed
+                    .remote_candidates
+                    .iter()
+                    .find(|candidate| &candidate.id == selected_id)
+                    .ok_or_else(|| {
+                        SyncError::UnresolvedConflicts("selected remote candidate is stale".into())
+                    })?;
+                let current = current_plan
+                    .conflicts
+                    .iter()
+                    .find(|conflict| conflict.path == choice.path)
+                    .ok_or_else(|| {
+                        SyncError::UnresolvedConflicts("current conflict is missing".into())
+                    })?;
+                let candidate = current
+                    .remote_candidates
+                    .iter()
+                    .find(|candidate| same_candidate_content(selected, candidate))
+                    .ok_or_else(|| {
+                        SyncError::UnresolvedConflicts("selected remote content changed".into())
+                    })?;
+                rebound.remote_version_id = Some(candidate.id.clone());
+            }
+            Ok(rebound)
+        })
+        .collect()
+}
+
+fn same_entry(left: &SnapshotEntry, right: &SnapshotEntry) -> bool {
+    match (left, right) {
+        (SnapshotEntry::File { sha256: a, .. }, SnapshotEntry::File { sha256: b, .. }) => a == b,
+        (SnapshotEntry::Tombstone, SnapshotEntry::Tombstone) => true,
+        _ => false,
+    }
+}
+
+fn same_optional_entry(left: Option<&SnapshotEntry>, right: Option<&SnapshotEntry>) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => same_entry(left, right),
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+fn same_entry_map(
+    left: &BTreeMap<RelativePath, SnapshotEntry>,
+    right: &BTreeMap<RelativePath, SnapshotEntry>,
+) -> bool {
+    left.len() == right.len()
+        && left.iter().all(|(path, entry)| {
+            right
+                .get(path)
+                .is_some_and(|other| same_entry(entry, other))
+        })
+}
+
+fn same_optional_entry_map(
+    left: &BTreeMap<RelativePath, Option<SnapshotEntry>>,
+    right: &BTreeMap<RelativePath, Option<SnapshotEntry>>,
+) -> bool {
+    left.len() == right.len()
+        && left.iter().all(|(path, entry)| {
+            right
+                .get(path)
+                .is_some_and(|other| same_optional_entry(entry.as_ref(), other.as_ref()))
+        })
+}
+
+fn same_candidate_content(left: &RemoteCandidate, right: &RemoteCandidate) -> bool {
+    same_optional_entry(left.entry.as_ref(), right.entry.as_ref())
+        && match (&left.file, &right.file) {
+            (Some(left), Some(right)) => {
+                left.path == right.path && same_entry(&left.entry, &right.entry)
+            }
+            (None, None) => true,
+            _ => false,
+        }
+}
+
+fn same_candidate_map(
+    left: &BTreeMap<RelativePath, RemoteCandidate>,
+    right: &BTreeMap<RelativePath, RemoteCandidate>,
+) -> bool {
+    left.len() == right.len()
+        && left.iter().all(|(path, candidate)| {
+            right
+                .get(path)
+                .is_some_and(|other| same_candidate_content(candidate, other))
+        })
 }
 
 pub fn resolve_conflict(
@@ -200,7 +396,10 @@ pub fn plan_sync(
     combined.extend(remote_entries);
     validate_entries(&combined).map_err(SyncError::Integrity)?;
 
-    let mut plan = SyncPlan::default();
+    let mut plan = SyncPlan {
+        local_snapshot: local.clone(),
+        ..SyncPlan::default()
+    };
     for path in paths {
         let saved = baseline.get(&path);
         let base_entry = saved.and_then(|b| {
@@ -306,7 +505,13 @@ mod tests {
                 remote_version: Some("8".into()),
             });
             let local = local.map(entry);
-            let remote = remote_hash.map(remote);
+            let remote = remote_hash.map(|hash| {
+                let mut file = remote(hash);
+                if Some(hash) == base {
+                    file.version = "8".into();
+                }
+                file
+            });
             let plan = plan_sync(
                 &baseline
                     .map(|b| BTreeMap::from([(path(), b)]))
@@ -333,6 +538,99 @@ mod tests {
             };
             assert_eq!(actual, expected, "{name}");
         }
+    }
+
+    #[test]
+    fn same_content_remote_revision_change_does_not_require_choice() {
+        let baseline = BTreeMap::from([(
+            path(),
+            FileBaseline {
+                sha256: Some([1; 32]),
+                remote_id: Some("file-id".into()),
+                remote_version: Some("8".into()),
+            },
+        )]);
+        let local = BTreeMap::from([(path(), entry(1))]);
+        let mut version_changed = remote(1);
+        version_changed.version = "10".into();
+        let mut id_changed = remote(1);
+        id_changed.id = "replacement-file-id".into();
+        let revision_changes = [version_changed, id_changed];
+
+        for remote in revision_changes {
+            let plan = plan_sync(
+                &baseline,
+                &local,
+                &BTreeMap::from([(path(), remote.clone())]),
+            )
+            .unwrap();
+
+            assert!(plan.publish_local.is_empty());
+            assert!(plan.apply_remote.is_empty());
+            assert!(plan.conflicts.is_empty());
+        }
+    }
+
+    #[test]
+    fn conflict_choice_rebinds_after_revision_or_id_change_but_not_content_change() {
+        let baseline = BTreeMap::from([(
+            path(),
+            FileBaseline {
+                sha256: Some([1; 32]),
+                remote_id: Some("old-file-id".into()),
+                remote_version: Some("8".into()),
+            },
+        )]);
+        let local = BTreeMap::from([(path(), entry(3))]);
+        let displayed_remote = RemoteFile {
+            id: "old-file-id".into(),
+            version: "9".into(),
+            ..remote(2)
+        };
+        let displayed = plan_sync(
+            &baseline,
+            &local,
+            &BTreeMap::from([(path(), displayed_remote)]),
+        )
+        .unwrap();
+        let choice = ConflictChoice {
+            path: path(),
+            selected: LocalOrRemote::Remote,
+            remote_version_id: Some(RemoteVersionId::DriveFile("old-file-id".into())),
+        };
+
+        let current_remote = RemoteFile {
+            id: "replacement-file-id".into(),
+            version: "10".into(),
+            ..remote(2)
+        };
+        let current = plan_sync(
+            &baseline,
+            &local,
+            &BTreeMap::from([(path(), current_remote)]),
+        )
+        .unwrap();
+
+        assert!(displayed.has_same_content_as(&current));
+        let rebound = rebind_conflict_choices(&displayed, &current, &[choice.clone()]).unwrap();
+        assert_eq!(
+            rebound[0].remote_version_id,
+            Some(RemoteVersionId::DriveFile("replacement-file-id".into()))
+        );
+
+        let changed_remote = RemoteFile {
+            id: "replacement-file-id".into(),
+            version: "11".into(),
+            ..remote(4)
+        };
+        let changed = plan_sync(
+            &baseline,
+            &local,
+            &BTreeMap::from([(path(), changed_remote)]),
+        )
+        .unwrap();
+        assert!(!displayed.has_same_content_as(&changed));
+        assert!(rebind_conflict_choices(&displayed, &changed, &[choice]).is_err());
     }
 
     #[test]
@@ -457,5 +755,59 @@ mod tests {
             &BTreeMap::from([(remote_path, remote_file)]),
         );
         assert!(matches!(result, Err(SyncError::Integrity(_))));
+    }
+
+    #[test]
+    fn resolved_snapshot_requires_all_choices_and_rejects_incompatible_tree() {
+        let parent = RelativePath::new("touchHLE_apps/parent").unwrap();
+        let child = RelativePath::new("touchHLE_apps/parent/child").unwrap();
+        let plan = SyncPlan {
+            local_snapshot: BTreeMap::from([(parent.clone(), entry(1))]),
+            conflicts: vec![
+                FileConflict {
+                    path: parent.clone(),
+                    local: Some(entry(1)),
+                    remote_candidates: vec![RemoteCandidate {
+                        id: RemoteVersionId::DriveFile("parent-id".into()),
+                        entry: None,
+                        file: None,
+                    }],
+                },
+                FileConflict {
+                    path: child.clone(),
+                    local: None,
+                    remote_candidates: vec![RemoteCandidate {
+                        id: RemoteVersionId::DriveFile("child-id".into()),
+                        entry: Some(entry(2)),
+                        file: Some(RemoteFile {
+                            path: child.clone(),
+                            id: "child-id".into(),
+                            version: "1".into(),
+                            entry: entry(2),
+                            parent_id: None,
+                        }),
+                    }],
+                },
+            ],
+            ..SyncPlan::default()
+        };
+        assert!(plan.resolved_snapshot(&[]).is_err());
+
+        let incompatible = [
+            ConflictChoice {
+                path: parent,
+                selected: LocalOrRemote::Local,
+                remote_version_id: None,
+            },
+            ConflictChoice {
+                path: child,
+                selected: LocalOrRemote::Remote,
+                remote_version_id: Some(RemoteVersionId::DriveFile("child-id".into())),
+            },
+        ];
+        assert!(matches!(
+            plan.resolved_snapshot(&incompatible),
+            Err(SyncError::UnresolvedConflicts(_))
+        ));
     }
 }

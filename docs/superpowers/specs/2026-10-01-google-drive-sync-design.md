@@ -7,8 +7,8 @@
 ## Summary
 
 Add opt-in synchronization of `touchHLE_apps` and `touchHLE_sandbox` through
-Google Drive. Use OpenDAL's Google Drive service for remote object operations
-and a shared Rust sync engine for manifests, version comparison, backups, and
+Google Drive. Use the Drive v3 REST API for remote object operations and a
+shared Rust sync engine for manifests, version comparison, backups, and
 conflict resolution. Support Android and desktop platforms, including
 headless command-line launches.
 
@@ -30,8 +30,9 @@ changes for later reconciliation.
 - Preserve unselected versions and all prior versions without automatic
   deletion.
 - Use a dedicated Google Drive folder named `touchHLE`.
-- Use the narrowest practical Drive permission and store OAuth tokens in
-  platform-protected storage.
+- Use the `drive.file` OAuth scope and store OAuth tokens in platform-protected
+  storage. The adapter creates and operates only on files belonging to this
+  application in its app-owned `touchHLE` folder.
 
 ## Non-Goals
 
@@ -48,19 +49,20 @@ changes for later reconciliation.
 
 - `SyncEngine`: provider-independent manifest scanning, hashing, three-way
   comparison, merge planning, and local apply/backup operations.
-- Google Drive adapter: OpenDAL-backed listing, reading, and writing under
-  the app-owned `touchHLE` Drive folder.
-- Platform authentication adapters: browser-based OAuth authorization for
-  desktop and Android, plus refresh-token storage in each platform's secure
-  credential store.
+- Google Drive adapter: direct Drive v3 REST listing, reading, writing, and
+  deletion under the app-owned `touchHLE` Drive folder.
+- Platform authentication adapters: loopback system-browser OAuth with PKCE
+  and a stored refresh token on desktop; Google Identity Services
+  `AuthorizationClient` and SDK-managed short-lived access tokens on Android.
+  Store returned tokens only in each platform's protected credential storage.
 - Sync coordinator: startup and shutdown hooks, pending-work tracking, and
   progress/error reporting.
 - Conflict resolver: graphical per-file choices in the app-picker flow.
   Headless mode reports conflicts and directs the user to graphical mode.
 
 The sync engine must run away from the SDL/UI event thread. Provider I/O and
-hashing must not freeze rendering or input. The implementation must verify
-which OpenDAL runtime/blocking interface is appropriate for every target.
+hashing must not freeze rendering or input. The adapter reuses a blocking HTTP
+client and connection pool on every supported target.
 
 ### Remote Layout and Version Model
 
@@ -91,8 +93,8 @@ Each installation stores its stable device ID, last successfully applied
 commit ID, per-path baseline hashes, and pending local state. This local
 baseline is required to detect cloud changes after offline execution. The
 application commit ID is the authoritative cloud revision for synchronization;
-native Drive file IDs or revision metadata may be recorded when OpenDAL
-exposes them, but correctness must not depend on their availability.
+Drive file IDs are adapter implementation details and correctness must not
+depend on them.
 
 The old blobs and commits remain available for restoration. There is no
 automatic garbage collection in v1. Consequently, Drive usage can grow over
@@ -166,19 +168,22 @@ the emulator loop returns.
 
 ### Authentication and Permissions
 
-Use Google OAuth from the system browser with platform-appropriate clients.
-The app creates its own `touchHLE` folder and requests `drive.file` rather than
-general Drive access. Refresh tokens must be stored using the platform's
-secure credential facility; never accept tokens as command-line arguments.
-Headless mode reuses previously authorized credentials and never prompts for
-interactive authorization.
-
-OpenDAL performs remote file operations after authorization; it does not
-provide the initial user-consent flow. OpenDAL's current Google Drive
-documentation describes the broader `drive` scope, so the implementation must
-prove that `drive.file` is sufficient for creating, listing, reading, and
-writing this app-owned folder. Do not silently widen permissions if that
-verification fails; stop for a separate decision.
+Use platform-appropriate Google authorization. Desktop uses the system
+browser, PKCE, and a loopback callback; its refresh token is stored in the
+platform's secure credential facility. Android uses Google Identity Services
+`AuthorizationClient` for the `drive.file` scope, with the package name and
+signing-certificate SHA-1 registered as an Android OAuth client in Google
+Cloud. Android access tokens are short-lived and refreshed by calling
+`AuthorizationClient` again; do not exchange or store a server refresh token
+in the app. Store the current access token only in Android-protected storage.
+The app creates its own `touchHLE` folder and uses `drive.file`, which limits
+access to files created by or explicitly opened with this application. Never
+accept tokens as command-line arguments. If Android authorization needs user
+resolution, allow the platform authorization UI while keeping local files
+usable if the user cancels or the device is offline. Headless mode reuses
+previously authorized credentials and never starts an interactive prompt.
+Credentials from earlier scope versions must be reauthorized once before
+synchronization can continue.
 
 ## Failure and Integrity Rules
 
@@ -212,22 +217,23 @@ verification fails; stop for a separate decision.
 
 ## Validation Risks
 
-- Confirm the OpenDAL Google Drive service builds for all target platforms
-  and supports the required directory, list, read, and write operations.
-- Verify `drive.file` access and the required file metadata through the
-  OpenDAL service. Add a narrow provider-specific metadata adapter only if
-  required; do not broaden OAuth scope without approval.
+- Confirm the direct Google Drive REST adapter builds for all target platforms
+  and supports the required folder, list, read, write, upload, and delete
+  operations.
+- Verify folder creation, pagination, multipart and resumable upload, media
+  download, and required metadata using the `drive.file` scope.
 - Verify `.app` bundles and cross-platform path constraints, including
   case-insensitive filesystems and symlink handling.
 - Confirm every guest and host exit route reaches the sync coordinator without
   invoking guest lifecycle callbacks twice.
-- Establish the Google OAuth application/client ownership and any required
-  consent-screen verification before distributing builds.
+- Establish the Google OAuth application/client ownership and complete any
+  verification required for the selected `drive.file` scope and distribution
+  model before public release.
 
 ## References
 
-- [OpenDAL Google Drive service](https://opendal.apache.org/docs/rust/opendal/services/struct.Gdrive.html)
 - [Google Drive files resource](https://developers.google.com/workspace/drive/api/reference/rest/v3/files)
 - [Google Drive revisions resource](https://developers.google.com/workspace/drive/api/reference/rest/v3/revisions)
+- [Google Android authorization](https://developers.google.com/identity/authorization/android)
 - [Google OAuth for installed applications](https://developers.google.com/identity/protocols/oauth2/native-app)
 - [Google Drive API authorization scopes](https://developers.google.com/workspace/drive/api/guides/api-specific-auth)

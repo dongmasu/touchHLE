@@ -6,9 +6,11 @@
 
 **Architecture:** Add a provider-independent Rust sync engine for scanning, immutable snapshots, three-way comparison, and safe local application. Put Google Drive operations and per-platform OAuth/token storage behind adapters, then coordinate sync around the existing app-picker, guest launch, and exit flows.
 
-**Tech Stack:** Rust 2021, OpenDAL Google Drive service, SHA-256, serde JSON, existing UIKit-like app-picker UI, Android Java/Gradle integration, deterministic fake remote store for tests.
+**Tech Stack:** Rust 2021, Google Drive v3 REST API via reqwest, SHA-256, serde JSON, existing UIKit-like app-picker UI, Android Java/Gradle integration, deterministic fake remote store for tests.
 
 **Spec:** `docs/superpowers/specs/2026-10-01-google-drive-sync-design.md`
+
+> **Progress (2026-10-03):** The user later approved replacing OpenDAL with direct Google Drive REST calls while retaining `RemoteStore` and the sync engine. The adapter now uses the narrower `drive.file` scope; credentials from prior scope versions require one interactive reauthorization.
 
 ## Global Constraints
 
@@ -21,8 +23,7 @@
 - Compare local and remote state against the last successfully applied baseline; use tombstones for deletions.
 - Show each conflicting version's size and modification time and require a per-path choice.
 - Preserve unselected content and prior history; v1 must not automatically delete or garbage-collect remote versions.
-- Use an app-owned Drive folder named `touchHLE` and the narrowest practical scope, `drive.file`.
-- Do not broaden OAuth permissions if `drive.file` is insufficient; stop and ask for a separate decision.
+- Use an app-owned Drive folder named `touchHLE` and the `drive.file` OAuth scope.
 - Keep tokens out of command-line arguments and logs; use platform-protected storage.
 - Verify downloaded hashes and stage local changes before applying them; do not advance the baseline after partial failure.
 - Keep hashing and provider I/O off the SDL/UI event thread.
@@ -203,7 +204,7 @@ git add src/sync.rs src/sync/store.rs src/sync/engine.rs
 git commit -m "feat: add transactional sync engine"
 ```
 
-### Task 5: Validate OpenDAL and Add the Google Drive Adapter
+### Task 5: Implement the Google Drive REST Adapter
 
 **Files:**
 - Modify: `Cargo.toml`
@@ -213,25 +214,25 @@ git commit -m "feat: add transactional sync engine"
 - Test: `src/sync/gdrive.rs`
 
 **Interfaces:**
-- `GoogleDriveStore`: implements `RemoteStore` using OpenDAL for the app-owned `touchHLE` folder.
+- `GoogleDriveStore`: implements `RemoteStore` using Drive v3 REST for the app-owned `touchHLE` folder.
 - `GoogleDriveStore::connect(config: DriveConfig) -> Result<Self, SyncError>` receives an access-token provider and never logs token contents.
 - Remote objects use `objects/<sha256>` and `commits/<uuid>.json`; validate paths returned by the provider before parsing or applying them.
 
-- [ ] **Step 1: Verify OpenDAL target support and `drive.file` behavior before adding the dependency**
+- [ ] **Step 1: Verify the Drive v3 operations and reqwest target support**
 
-Build a minimal isolated compile probe for the selected OpenDAL release on the host and Android target. Verify create/list/read/write of files inside a folder created by this application using an OAuth token limited to `drive.file`. Do not use a broader token or broaden the requested permission to make the probe pass.
+Verify folder creation, paginated listing, metadata lookup, media download, multipart upload, resumable upload, and deletion on desktop and Android using `drive.file`.
 
-- [ ] **Step 2: Stop for a user decision if the scope or target gate fails**
+- [ ] **Step 2: Preserve the existing adapter contract**
 
-If OpenDAL cannot operate with `drive.file`, or its runtime/accessor cannot build for Android, do not add a broader scope or silently substitute a provider. Report the exact failing operation and request a separate design decision.
+Keep `RemoteStore` unchanged. Cache folder IDs for the lifetime of the store, reuse a single HTTP connection pool, refresh once on HTTP 401, and do not blindly retry non-idempotent creates.
 
-- [ ] **Step 3: Add adapter contract tests around a fake OpenDAL operator**
+- [ ] **Step 3: Add HTTP-boundary adapter tests**
 
-Assert key layout, stable commit encoding, content-addressed object keys, duplicate object handling, and propagation of not-found versus transport errors.
+Assert pagination, safe request logging, bounded retry classification, token refresh, content-addressed object verification, and exact Drive upload endpoints.
 
-- [ ] **Step 4: Implement the OpenDAL adapter**
+- [ ] **Step 4: Implement the REST adapter**
 
-Use only APIs available in the verified release. Keep provider calls asynchronous or off the UI thread as required by the supported target runtime.
+Use multipart upload for small objects and resumable sessions for objects larger than 5 MiB. Read every new immutable object back and compare the full bytes before allowing its commit to publish.
 
 - [ ] **Step 5: Run adapter checks and commit**
 
@@ -256,9 +257,9 @@ git commit -m "feat: add Google Drive sync store"
 **Interfaces:**
 - `TokenStore`: `load() -> Result<Option<TokenSet>, AuthError>`, `save(TokenSet)`, and `clear()`, with implementations backed by the platform's protected credential facility.
 - `TokenSet`: access token, refresh token, and expiry; redact all token fields from `Debug`.
-- `AccessTokenProvider::access_token() -> Result<SecretString, AuthError>` returns a valid access token and refreshes through OAuth when expiry is within 60 seconds; never expose token material through `Debug`.
+- `AccessTokenProvider::access_token() -> Result<SecretString, AuthError>` reuses the cached access token until Google Drive rejects it, then refreshes through OAuth and retries the operation once; never expose token material through `Debug`.
 - `DriveConfig` receives the platform's public OAuth client ID; do not add a client secret to the repository or command-line arguments.
-- `authorize_interactively() -> Result<TokenSet, AuthError>` uses system-browser OAuth authorization code with PKCE and requests only `drive.file`.
+- `authorize_interactively() -> Result<TokenSet, AuthError>` uses system-browser OAuth authorization code with PKCE and requests `drive.file`.
 - Headless authorization reads existing stored credentials and returns a non-interactive error if none exist.
 - Each installation persists a stable random `device_id` in sync state; it is not derived from a username or credential.
 
@@ -451,7 +452,7 @@ git commit -m "feat: resolve per-file sync conflicts"
 
 - [ ] **Step 1: Document account connection and opt-in**
 
-Explain supported platforms, Google account authorization, `drive.file` access, the public OAuth client setup/consent requirements, and the exact synchronized directories. Do not publish client secrets or tokens.
+Explain supported platforms, Google account authorization with the `drive.file` scope, one-time reauthorization after upgrading old credentials, the public OAuth client setup/consent requirements, and the exact synchronized directories. Do not publish client secrets or tokens.
 
 - [ ] **Step 2: Document offline, headless, and conflict behavior**
 

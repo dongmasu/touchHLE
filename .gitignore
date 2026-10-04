@@ -2,6 +2,7 @@
 /vendor/boost
 /touchHLE_sandbox
 /touchHLE_apps
+/.touchHLE_sync
 touchHLE_log.txt
 touchHLE_wallpaper.*
 
@@ -9,6 +10,7 @@ touchHLE_wallpaper.*
 
 *.iml
 .gradle
+.kotlin
 /local.properties
 .idea/
 /build

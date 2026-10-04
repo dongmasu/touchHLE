@@ -405,7 +405,7 @@ pub fn plan_sync_with_local_baseline(
     local: &BTreeMap<RelativePath, SnapshotEntry>,
     remote_tips: &[RemoteTip],
 ) -> Result<SyncPlan, SyncError> {
-    plan_sync_internal(remote_baseline, local_baseline, local, remote_tips, false)
+    plan_sync_internal(remote_baseline, local_baseline, local, remote_tips)
 }
 
 pub fn plan_sync_without_common_ancestor(
@@ -413,7 +413,7 @@ pub fn plan_sync_without_common_ancestor(
     local: &BTreeMap<RelativePath, SnapshotEntry>,
     remote_tips: &[RemoteTip],
 ) -> Result<SyncPlan, SyncError> {
-    plan_sync_internal(&BTreeMap::new(), local_baseline, local, remote_tips, true)
+    plan_sync_internal(&BTreeMap::new(), local_baseline, local, remote_tips)
 }
 
 fn plan_sync_internal(
@@ -421,7 +421,6 @@ fn plan_sync_internal(
     local_baseline: &BTreeMap<RelativePath, SnapshotEntry>,
     local: &BTreeMap<RelativePath, SnapshotEntry>,
     remote_tips: &[RemoteTip],
-    unrelated_roots: bool,
 ) -> Result<SyncPlan, SyncError> {
     let mut tips = remote_tips.to_vec();
     tips.sort_by_key(|tip| tip.commit_id);
@@ -487,15 +486,14 @@ fn plan_sync_internal(
             .iter()
             .filter(|candidate| !same_content(remote_base, candidate.entry.as_ref()))
             .collect();
-        let unrelated_file_tombstone = unrelated_roots
-            && candidates.iter().any(|candidate| {
-                matches!(candidate.entry.as_ref(), Some(SnapshotEntry::File { .. }))
-            })
+        let file_tombstone_divergence = candidates
+            .iter()
+            .any(|candidate| matches!(candidate.entry.as_ref(), Some(SnapshotEntry::File { .. })))
             && candidates
                 .iter()
                 .any(|candidate| candidate.entry.as_ref() == Some(&SnapshotEntry::Tombstone));
         if structural_paths.contains(&path)
-            || unrelated_file_tombstone
+            || file_tombstone_divergence
             || changed_candidates.iter().skip(1).any(|candidate| {
                 !same_content(
                     changed_candidates[0].entry.as_ref(),
@@ -998,6 +996,29 @@ mod tests {
             }
             .validate(&plan)
             .unwrap();
+        }
+    }
+
+    #[test]
+    fn related_file_and_explicit_deletion_require_choice_without_live_base() {
+        for base in [None, Some(SnapshotEntry::Tombstone)] {
+            let baseline = snapshot(&[("entry", base)]);
+            let tips = [
+                tip(2, &[("entry", Some(SnapshotEntry::Tombstone))]),
+                tip(3, &[("entry", Some(file(4)))]),
+            ];
+            let plan =
+                plan_sync_with_local_baseline(&baseline, &BTreeMap::new(), &BTreeMap::new(), &tips)
+                    .unwrap();
+            assert!(plan.apply_remote.is_empty());
+            assert!(plan.publish_local.is_empty());
+            assert_eq!(plan.conflicts.len(), 1);
+            assert_eq!(plan.conflicts[0].path, path("entry"));
+            assert_eq!(plan.conflicts[0].remote_candidates.len(), 2);
+            assert_eq!(
+                plan.merge_parents,
+                vec![Uuid::from_u128(2), Uuid::from_u128(3)]
+            );
         }
     }
 

@@ -74,6 +74,18 @@ touchHLE has a built-in app picker. If you put your `.ipa` files and `.app` bund
 
 To configure the options, you can edit the `touchHLE_options.txt` file. To get a list of options, look in the `OPTIONS_HELP.txt` file.
 
+### Optional Google Drive sync
+
+The app picker can opt in to syncing `touchHLE_apps` and `touchHLE_sandbox`
+between desktop and Android installations. Sync is offline-friendly and asks
+you to choose a local or cloud version when the same file changed differently.
+Google authorization is limited to Drive files created or opened with
+touchHLE; synchronized data stays in the app-owned `touchHLE` folder.
+Android uses Google Play services authorization and requires an Android OAuth
+client registered with the installed package name and signing certificate
+SHA-1. See [Google Drive sync setup and recovery](dev-docs/google-drive-sync.md)
+for setup, conflict handling, and backup details.
+
 ## Command-line user interface
 
 **This section does not apply on Android.**
