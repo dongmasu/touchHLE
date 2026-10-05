@@ -141,6 +141,11 @@ fn AudioServicesGetProperty(
 
 fn AudioServicesPlaySystemSound(env: &mut Environment, sys_sound_id: SystemSoundID) {
     if sys_sound_id == kSystemSoundID_Vibrate {
+        #[cfg(target_os = "android")]
+        if env.window.is_some() {
+            env.on_parent_stack_in_coroutine(|window, _| window.vibrate());
+        }
+        #[cfg(not(target_os = "android"))]
         log!("TODO: vibration (AudioServicesPlaySystemSound)");
     } else {
         let (state, context) =

@@ -25,8 +25,12 @@ use sdl2_sys::SDL_PowerState;
 use std::collections::{HashMap, VecDeque};
 use std::env;
 use std::f32::consts::{FRAC_PI_2, PI};
+#[cfg(target_os = "android")]
+use std::ffi::CStr;
 use std::num::NonZeroU32;
 use std::ptr::null_mut;
+#[cfg(target_os = "android")]
+use std::ptr::NonNull;
 use std::time::{Duration, Instant};
 
 #[allow(non_camel_case_types)]
@@ -210,6 +214,77 @@ fn surface_from_image(image: &Image) -> Surface<'_> {
     surface
 }
 
+#[cfg(target_os = "android")]
+struct BuiltinVibrator {
+    // Keep the subsystem alive until after the haptic device is closed.
+    _subsystem: sdl2::HapticSubsystem,
+    haptic: NonNull<sdl2_sys::SDL_Haptic>,
+}
+
+#[cfg(target_os = "android")]
+impl BuiltinVibrator {
+    fn new(sdl: &sdl2::Sdl) -> Option<Self> {
+        let subsystem = match sdl.haptic() {
+            Ok(subsystem) => subsystem,
+            Err(err) => {
+                log!("Warning: Could not initialize SDL haptics: {}", err);
+                return None;
+            }
+        };
+
+        let count = unsafe { sdl2_sys::SDL_NumHaptics() };
+        if count < 0 {
+            log!(
+                "Warning: Could not enumerate SDL haptics: {}",
+                sdl2::get_error()
+            );
+            return None;
+        }
+        for index in 0..count {
+            let name = unsafe { sdl2_sys::SDL_HapticName(index) };
+            if name.is_null() || unsafe { CStr::from_ptr(name) }.to_bytes() != b"VIBRATOR_SERVICE" {
+                continue;
+            }
+            let Some(haptic) = NonNull::new(unsafe { sdl2_sys::SDL_HapticOpen(index) }) else {
+                log!(
+                    "Warning: Could not open built-in vibrator: {}",
+                    sdl2::get_error()
+                );
+                return None;
+            };
+            if unsafe { sdl2_sys::SDL_HapticRumbleInit(haptic.as_ptr()) } != 0 {
+                log!(
+                    "Warning: Could not initialize vibrator rumble: {}",
+                    sdl2::get_error()
+                );
+                unsafe { sdl2_sys::SDL_HapticClose(haptic.as_ptr()) };
+                return None;
+            }
+            return Some(Self {
+                _subsystem: subsystem,
+                haptic,
+            });
+        }
+        None
+    }
+
+    fn vibrate(&mut self) {
+        if unsafe { sdl2_sys::SDL_HapticRumblePlay(self.haptic.as_ptr(), 1.0, 250) } != 0 {
+            log!(
+                "Warning: Could not play vibrator rumble: {}",
+                sdl2::get_error()
+            );
+        }
+    }
+}
+
+#[cfg(target_os = "android")]
+impl Drop for BuiltinVibrator {
+    fn drop(&mut self) {
+        unsafe { sdl2_sys::SDL_HapticClose(self.haptic.as_ptr()) };
+    }
+}
+
 pub struct Window {
     _sdl_ctx: sdl2::Sdl,
     video_ctx: sdl2::VideoSubsystem,
@@ -239,6 +314,8 @@ pub struct Window {
     stick_active: bool,
     _sensor_ctx: sdl2::SensorSubsystem,
     accelerometer: Option<sdl2::sensor::Sensor>,
+    #[cfg(target_os = "android")]
+    builtin_vibrator: Option<BuiltinVibrator>,
     virtual_cursor_last: Option<(f32, f32, bool, bool)>,
     virtual_cursor_last_unsticky: Option<(f32, f32, Instant)>,
     virtual_accelerometer_last: Option<(f32, f32, bool)>,
@@ -360,6 +437,9 @@ impl Window {
             }
         }
 
+        #[cfg(target_os = "android")]
+        let builtin_vibrator = BuiltinVibrator::new(&sdl_ctx);
+
         #[cfg(target_os = "macos")]
         let max_height = window.size().1;
 
@@ -394,6 +474,8 @@ impl Window {
             stick_active: false,
             _sensor_ctx: sensor_ctx,
             accelerometer,
+            #[cfg(target_os = "android")]
+            builtin_vibrator,
             virtual_cursor_last: None,
             virtual_cursor_last_unsticky: None,
             virtual_accelerometer_last: None,
@@ -416,6 +498,14 @@ impl Window {
         }
 
         window
+    }
+
+    #[cfg(target_os = "android")]
+    pub fn vibrate(&mut self) {
+        assert!(self.on_main_stack);
+        if let Some(vibrator) = self.builtin_vibrator.as_mut() {
+            vibrator.vibrate();
+        }
     }
 
     /// Poll for events from the OS. This needs to be done reasonably often
